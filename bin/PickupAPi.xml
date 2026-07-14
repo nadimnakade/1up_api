@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>PickupAPi</name>
+    </assembly>
+    <members>
+        <member name="T:PickupAPi.handler.CompanyCategory">
+            <summary>
+            Summary description for CompanyCategory
+            </summary>
+        </member>
+        <member name="T:PickupAPi.SearchApplication">
+            <summary>
+            Summary description for SearchApplication
+            </summary>
+        </member>
+    </members>
+</doc>

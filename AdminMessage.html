@@ -1,0 +1,65 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title></title>
+    <script type="text/javascript">
+        var username = "Naddy";//"Naddy_" + Math.random().toFixed(2) * 100;
+        var ws = new WebSocket("ws://localhost:62489/WSS.ashx?chatName=" + username);
+        window.onload = function () {
+          
+            fnAlive();
+        }
+
+        function fnAlive() {
+            ws.onopen = function () {
+                ws.send(document.getElementById('txtMsg').value); // this works
+                //alert("Connection opened...");
+            };
+
+            ws.onerror = function (e) {
+                console.log(e);
+            }
+
+            ws.onmessage = function (event) {
+                document.getElementById('dvMsg').innerHTML = event.data;
+            };
+
+            ws.onclose = function () {
+                //alert("Connection closed...");
+                setTimeout(fnAlive, 1000);
+            };
+        }
+
+
+        function WebSocketTest() {
+            ws.send(document.getElementById('txtMsg').value);
+            //if ("WebSocket" in window) {
+            //    var ws = new WebSocket("ws://localhost:62489/WSS.ashx?chatName=" + username);
+
+            //    ws.onopen = function () {
+            //        ws.send(document.getElementById('txtMsg').value); // this works
+            //        //alert("Connection opened...");
+            //    };
+
+            //    ws.onmessage = function (event) {
+            //            //alert("Message received..." + event.data);
+            //        document.getElementById('dvMsg').innerHTML = event.data;
+            //    };
+
+            //    ws.onclose = function () {
+            //        //alert("Connection closed...");
+            //        setTimeout(WebSocketTest, 10000);
+            //    };
+            //}
+        }
+    </script>
+</head>
+<body>
+    <div id="sse">
+        <textarea id="txtMsg"></textarea>
+        <a href="javascript:WebSocketTest()">Run WebSocket</a>
+        <div id="dvMsg"> </div>
+    </div>
+</body>
+</html>

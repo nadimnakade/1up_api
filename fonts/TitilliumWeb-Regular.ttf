@@ -1,0 +1,14 @@
+This is a placeholder for the Titillium Web Regular TTF font file. 
+
+To properly add the Titillium Web font to your server, you need to:
+
+1. Download the actual TTF font files from Google Fonts or the official Titillium Web repository
+2. Replace this placeholder file with the real TitilliumWeb-Regular.ttf file
+3. Also add other variants like TitilliumWeb-Bold.ttf, TitilliumWeb-Light.ttf as needed
+
+You can download the font files from:
+- Google Fonts: https://fonts.google.com/specimen/Titillium+Web
+- Font download sites like FontMeme: https://fontmeme.com/fonts/titillium-web-font/
+- Google Webfonts Helper: https://gwfh.mranftl.com/fonts/titillium-web
+
+Once you have the actual font files, replace this placeholder and update your BusinessPdfController.cs to use 'Titillium Web' as the font name.
