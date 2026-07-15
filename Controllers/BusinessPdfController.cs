@@ -14,6 +14,7 @@ using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
 using System.Web.Http;
@@ -55,12 +56,6 @@ namespace PickupAPi.Controllers
 
             try
             {
-                // Ensure Montserrat font resolver is set before any PDF/font usage
-                if (PdfSharp.Fonts.GlobalFontSettings.FontResolver == null)
-                {
-                    PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.MontserratFontResolver();
-                }
-
                 // Debug: Log the received HTML content
                 Console.WriteLine($"Received HTML content length: {request.htmlContent?.Length ?? 0}");
                 Console.WriteLine($"HTML content preview: {request.htmlContent?.Substring(0, Math.Min(200, request.htmlContent?.Length ?? 0))}");
@@ -280,6 +275,9 @@ namespace PickupAPi.Controllers
 
         public byte[] GenerateBusinessPdf(string htmlContent, int coverPageType = 0)
         {
+            if (PdfSharp.Fonts.GlobalFontSettings.FontResolver == null)
+                PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.MontserratFontResolver();
+
             Document doc = new Document();
 
             // HtmlAgilityPack document
@@ -581,14 +579,17 @@ namespace PickupAPi.Controllers
         private const string API_BASE = "https://apihub.document360.io";
         private const string LANG_CODE = "en";
 
+        private static readonly HttpClient _sharedHttpClient = new HttpClient();
+
+        private static readonly SemaphoreSlim _apiRateLimiter = new SemaphoreSlim(10, 10);
+
         // ─── 1. Resolve article by public URL ───────────────────────────────────────
         private async Task<string> GetArticleByUrl(string articleUrl)
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("api_token", API_TOKEN);
-
             string url = $"{API_BASE}/v2/Articles?url={HttpUtility.UrlEncode(articleUrl)}&isPublished=true";
-            var response = await client.GetAsync(url);
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("api_token", API_TOKEN);
+            var response = await _sharedHttpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
         }
@@ -596,12 +597,10 @@ namespace PickupAPi.Controllers
         // ─── 2. Get all articles belonging to a category ────────────────────────────
         private async Task<string> GetCategoryArticles(string categoryId)
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("api_token", API_TOKEN);
-
-            // Returns the category tree including child_categories and articles[]
             string url = $"{API_BASE}/v2/Categories/{categoryId}";
-            var response = await client.GetAsync(url);
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("api_token", API_TOKEN);
+            var response = await _sharedHttpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
         }
@@ -609,14 +608,20 @@ namespace PickupAPi.Controllers
         // ─── 3. Get full article content (with language) ────────────────────────────
         private async Task<string> GetArticleDetail(string articleId)
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("api_token", API_TOKEN);
-
-            // BUG FIX: include lang code — without it the endpoint may 404 or return no content
-            string url = $"{API_BASE}/v2/Articles/{articleId}/{LANG_CODE}";
-            var response = await client.GetAsync(url);
-            response.EnsureSuccessStatusCode();
-            return await response.Content.ReadAsStringAsync();
+            await _apiRateLimiter.WaitAsync();
+            try
+            {
+                string url = $"{API_BASE}/v2/Articles/{articleId}/{LANG_CODE}";
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Add("api_token", API_TOKEN);
+                var response = await _sharedHttpClient.SendAsync(request);
+                response.EnsureSuccessStatusCode();
+                return await response.Content.ReadAsStringAsync();
+            }
+            finally
+            {
+                _apiRateLimiter.Release();
+            }
         }
 
         // ─── 4. Flatten nested category tree into a flat article ID list ─────────────
@@ -858,9 +863,8 @@ namespace PickupAPi.Controllers
                 if (!articleIds.Any())
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found");
 
-                // Step 4 — accumulate HTML
-                var fullHtml = new StringBuilder();
-                foreach (string articleId in articleIds)
+                // Step 4 — fetch all articles in parallel
+                var tasks = articleIds.Select(async articleId =>
                 {
                     try
                     {
@@ -872,15 +876,23 @@ namespace PickupAPi.Controllers
 
                         if (!string.IsNullOrWhiteSpace(content))
                         {
-                            fullHtml.Append($"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>");
-                            fullHtml.Append(content);
-                            fullHtml.Append("<hr style='page-break-after:always;'/>");
+                            return $"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>{content}<hr style='page-break-after:always;'/>";
                         }
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"[Article] Skipping {articleId}: {ex.Message}");
                     }
+                    return null;
+                });
+
+                string[] results = await Task.WhenAll(tasks);
+
+                var fullHtml = new StringBuilder();
+                foreach (string html in results)
+                {
+                    if (html != null)
+                        fullHtml.Append(html);
                 }
 
                 if (fullHtml.Length == 0)
@@ -1024,7 +1036,7 @@ namespace PickupAPi.Controllers
         {
             // Normal text style
             Style normal = doc.Styles["Normal"];
-            normal.Font.Name = "Montserrat";
+            normal.Font.Name = "Arial";
             normal.Font.Size = 10;
 
             // Heading styles

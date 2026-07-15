@@ -777,7 +777,6 @@ D:\1up\Api\PickupAPi\bin\PdfSharp.dll
 D:\1up\Api\PickupAPi\bin\PdfSharp.Quality.dll
 D:\1up\Api\PickupAPi\bin\PdfSharp.Snippets.dll
 D:\1up\Api\PickupAPi\bin\PdfSharp.System.dll
-D:\1up\Api\PickupAPi\bin\PdfSharp.WPFonts.dll
 D:\1up\Api\PickupAPi\bin\Swashbuckle.Core.dll
 D:\1up\Api\PickupAPi\bin\System.Buffers.dll
 D:\1up\Api\PickupAPi\bin\System.ComponentModel.Annotations.dll
@@ -870,8 +869,6 @@ D:\1up\Api\PickupAPi\bin\PdfSharp.Quality.xml
 D:\1up\Api\PickupAPi\bin\PdfSharp.Snippets.pdb
 D:\1up\Api\PickupAPi\bin\PdfSharp.System.pdb
 D:\1up\Api\PickupAPi\bin\PdfSharp.System.xml
-D:\1up\Api\PickupAPi\bin\PdfSharp.WPFonts.pdb
-D:\1up\Api\PickupAPi\bin\PdfSharp.WPFonts.xml
 D:\1up\Api\PickupAPi\bin\System.Buffers.xml
 D:\1up\Api\PickupAPi\bin\System.Diagnostics.DiagnosticSource.xml
 D:\1up\Api\PickupAPi\bin\System.Memory.xml
