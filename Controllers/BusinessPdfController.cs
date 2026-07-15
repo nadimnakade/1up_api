@@ -1,5 +1,4 @@
 using HtmlAgilityPack;
-using Microsoft.Ajax.Utilities;
 using MigraDoc.DocumentObjectModel;
 using MigraDoc.DocumentObjectModel.Shapes;
 using MigraDoc.DocumentObjectModel.Tables;
@@ -20,7 +19,6 @@ using System.Web;
 using System.Web.Http;
 using System.Web.Http.Cors;
 using System.Web.Http.Description;
-using System.Web.UI.WebControls.WebParts;
 
 
 namespace PickupAPi.Controllers
@@ -34,11 +32,18 @@ namespace PickupAPi.Controllers
         private static string API_TOKEN = "qstNVgrrO9A6w9byiy2c/n4Cza4lkaOLmXX9KXSx6yH4/0FDSBdOeSnP40bamD7jaJegf5sb0azs9GH1aOALH1qxM74IHURyIdvhC2ijW9tmHyc5TuLG5KOYibNfRaQ0mzMIffNJzcFqff5TtUFb8w==";
 
 
-        int mainsrno = 1;
-        int subsrno = 1;
-        private readonly List<(string Title, int PageNumber)> blockquoteIndex = new List<(string, int)>();
         private List<(string Title, string Bookmark, string Level)> headings;
-        bool isFirst = true;
+        bool isFirstHeading = true;
+
+        // Blockquote type detection helpers
+        private enum BlockquoteType { None, Note, Warning, Tip }
+        private static readonly Dictionary<BlockquoteType, (string ariaLabel, string cssClass, string keyword)> BqSignatures =
+            new Dictionary<BlockquoteType, (string ariaLabel, string cssClass, string keyword)>()
+        {
+            { BlockquoteType.Note,    ("note",    "noteBox",    "Notes") },
+            { BlockquoteType.Warning, ("warning", "warningBox", "Warning") },
+            { BlockquoteType.Tip,     ("tip",     "tipBox",     "Tip") },
+        };
 
         [HttpPost]
         [Route("GeneratePdf")]
@@ -1161,51 +1166,18 @@ namespace PickupAPi.Controllers
                             break;
                         case "h2":
                             AddHeading(section, childNode.InnerText, "Heading2", 18);
-                            subsrno++;
                             break;
                         case "h3":
                             AddHeading(section, childNode.InnerText, "Heading3", 16);
-                            subsrno = 1;
-                            mainsrno++;
                             break;
                         case "h4":
                             AddHeading(section, childNode.InnerText, "Heading4", 14);
-                            subsrno = 1;
-                            mainsrno++;
                             break;
                         case "p":
                             AddParagraph(section, childNode);
                             break;
                         case "blockquote":
-                            //AddBlockquote(section, childNode);
-                            string type = "";
-                            // Pseudocode:
-                            // - The current condition uses IndexOf("Notes:") > 0, which will not match if "Notes:" is at the start (index 0).
-                            // - To match "Notes:" anywhere (including at the start), use IndexOf("Notes:") >= 0.
-                            // - Alternatively, use StartsWith("Notes:") if you only want to match when it is at the beginning.
-
-                            if (childNode.InnerText.Trim().IndexOf("Notes") >= 0)
-                            {
-                                string str = "";
-                                type = HttpContext.Current.Server.MapPath("~/logo/info_icon.png");
-                                //AddSpace(section);
-                                // Light blue background: #ddf7ff (221, 247, 255)
-                                AddStyledSection(section, "Note", childNode.InnerText.Trim(), MigraDoc.DocumentObjectModel.Color.FromRgb(221, 247, 255), MigraDoc.DocumentObjectModel.Color.FromRgb(28, 74, 113), type);
-                            }
-                            else if (childNode.InnerText.Trim().IndexOf("Warning") >= 0)
-                            {
-                                type = HttpContext.Current.Server.MapPath("~/logo/warning_icon.png");
-                                // Light yellow background: #fdf2ce (253, 242, 206), brown text: #7f6416 (127, 100, 22)
-                                AddStyledSection(section, "Warning", childNode.InnerText.Trim(), MigraDoc.DocumentObjectModel.Color.FromRgb(253, 242, 206), MigraDoc.DocumentObjectModel.Color.FromRgb(127, 100, 22), type);
-                            }
-                            else if (childNode.InnerText.Trim().IndexOf("Tip") >= 0)
-                            {
-                                type = HttpContext.Current.Server.MapPath("~/logo/tip_icon.png");
-                                // Green color matching the image: #8BC34A (139, 195, 74)
-                                AddStyledSection(section, "Tip", childNode.InnerText.Trim(), MigraDoc.DocumentObjectModel.Color.FromRgb(139, 195, 74), Colors.White, type);
-                            }
-                            // Add the blockquote title to the index list
-                            //blockquoteIndex.Add((childNode.InnerText.Trim(), 0)); // Page number will be updated later     
+                            AddBlockquote(section, childNode);
                             break;
                         case "ul":
                             AddList(section, childNode, false);
@@ -1231,6 +1203,69 @@ namespace PickupAPi.Controllers
                     }
                 }
             }
+        }
+
+        private void AddBlockquote(Section section, HtmlNode node)
+        {
+            string label = node.GetAttributeValue("aria-label", "");
+            string cssClass = node.GetAttributeValue("class", "");
+            string inner = node.InnerText.Trim();
+
+            // Detect type by priority: aria-label > css class > keyword match
+            var type = DetectBlockquoteType(label, cssClass, inner);
+            if (type == BlockquoteType.None) { AddParagraph(section, node); return; }
+
+            Color bgColor;
+            Color txtColor;
+            switch (type)
+            {
+                case BlockquoteType.Note:
+                    bgColor = Color.FromRgb(221, 247, 255);
+                    txtColor = Color.FromRgb(28, 74, 113);
+                    break;
+                case BlockquoteType.Warning:
+                    bgColor = Color.FromRgb(253, 242, 206);
+                    txtColor = Color.FromRgb(127, 100, 22);
+                    break;
+                case BlockquoteType.Tip:
+                    bgColor = Color.FromRgb(139, 195, 74);
+                    txtColor = Colors.White;
+                    break;
+                default:
+                    bgColor = Colors.White;
+                    txtColor = Colors.Black;
+                    break;
+            }
+
+            // Extract the actual content from Document360's structure
+            // If there's a .custom-warning-content or .info-text, use that inner HTML
+            var contentDiv = node.SelectSingleNode(".//div[contains(@class,'info-text')]")
+                         ?? node.SelectSingleNode(".//div[contains(@class,'custom-warning-content')]//div[contains(@class,'info-text')]");
+            string bodyHtml = contentDiv != null
+                ? contentDiv.InnerHtml
+                : node.InnerHtml;
+
+            AddStyledSection(section, type.ToString(), bodyHtml, bgColor, txtColor);
+        }
+
+        private BlockquoteType DetectBlockquoteType(string ariaLabel, string cssClass, string innerText)
+        {
+            string lowerLabel = ariaLabel?.ToLowerInvariant() ?? "";
+            string lowerClass = cssClass?.ToLowerInvariant() ?? "";
+
+            foreach (var entry in BqSignatures)
+            {
+                BlockquoteType bqType = entry.Key;
+                var sig = entry.Value;
+                if (lowerLabel.Contains(sig.ariaLabel)) return bqType;
+                if (lowerClass.Contains(sig.cssClass)) return bqType;
+                // Detect Document360 blockquote via data-border color
+            }
+            // Fallback: keyword match on inner text (original logic)
+            if (innerText.IndexOf("Note", StringComparison.OrdinalIgnoreCase) >= 0) return BlockquoteType.Note;
+            if (innerText.IndexOf("Warning", StringComparison.OrdinalIgnoreCase) >= 0) return BlockquoteType.Warning;
+            if (innerText.IndexOf("Tip", StringComparison.OrdinalIgnoreCase) >= 0) return BlockquoteType.Tip;
+            return BlockquoteType.None;
         }
 
         private void AddStyledSection(Section section, string title, string content, Color backgroundColor, Color textColor, string iconPath = null)
@@ -1336,28 +1371,154 @@ namespace PickupAPi.Controllers
             // Clean the main content
             string mainContent = CleanContent(updatedContent, title);
 
-            // Create content paragraph
-            Paragraph contentParagraph = contentCell.AddParagraph();
-
-            // Handle content with lists
-            if (mainContent.Contains("<li>") || mainContent.Contains("<ul>"))
-            {
-                ProcessListContent(contentCell, mainContent, textColor);
-            }
-            else
-            {
-                // Add plain text content
-                contentParagraph.AddText(mainContent);
-                contentParagraph.Format.Font.Color = textColor;
-                contentParagraph.Format.Font.Size = 10;
-                contentParagraph.Format.LineSpacing = Unit.FromCentimeter(0.25);
-                contentParagraph.Format.SpaceBefore = Unit.FromCentimeter(0.25);
-            }
+            // Parse and render HTML content inline (bold, italic, links, etc.)
+            RenderHtmlContentInCell(contentCell, mainContent, textColor);
 
             // Add spacing after section
             Paragraph spacer = section.AddParagraph();
             spacer.Format.SpaceBefore = Unit.FromCentimeter(0.01);
             spacer.Format.SpaceAfter = Unit.FromCentimeter(0.01);
+        }
+
+        /// <summary>
+        /// Parse raw HTML string and render inline elements (bold, italic, links, line breaks) into a table cell.
+        /// </summary>
+        private void RenderHtmlContentInCell(Cell cell, string html, Color textColor)
+        {
+            if (string.IsNullOrWhiteSpace(html)) return;
+
+            var htmlDoc = new HtmlDocument();
+            htmlDoc.LoadHtml(html);
+
+            foreach (var node in htmlDoc.DocumentNode.ChildNodes)
+            {
+                if (node.NodeType == HtmlNodeType.Text)
+                {
+                    if (!string.IsNullOrWhiteSpace(node.InnerText))
+                    {
+                        var p = cell.AddParagraph();
+                        p.AddText(WebUtility.HtmlDecode(node.InnerText));
+                        p.Format.Font.Color = textColor;
+                        p.Format.Font.Size = 10;
+                        p.Format.SpaceBefore = Unit.FromPoint(2);
+                        p.Format.SpaceAfter = Unit.FromPoint(2);
+                    }
+                }
+                else if (node.NodeType == HtmlNodeType.Element)
+                {
+                    switch (node.Name.ToLower())
+                    {
+                        case "p":
+                            var p = cell.AddParagraph();
+                            p.Format.Font.Color = textColor;
+                            p.Format.Font.Size = 10;
+                            p.Format.SpaceBefore = Unit.FromPoint(2);
+                            p.Format.SpaceAfter = Unit.FromPoint(2);
+                            p.Format.KeepTogether = true;
+                            RenderInlineContent(p, node, textColor);
+                            break;
+                        case "strong":
+                        case "b":
+                            var bP = cell.AddParagraph();
+                            bP.Format.Font.Color = textColor;
+                            bP.Format.Font.Size = 10;
+                            var ftB = bP.AddFormattedText(WebUtility.HtmlDecode(node.InnerText));
+                            ftB.Bold = true;
+                            break;
+                        case "em":
+                        case "i":
+                            var iP = cell.AddParagraph();
+                            iP.Format.Font.Color = textColor;
+                            iP.Format.Font.Size = 10;
+                            var ftI = iP.AddFormattedText(WebUtility.HtmlDecode(node.InnerText));
+                            ftI.Italic = true;
+                            break;
+                        case "a":
+                            var aP = cell.AddParagraph();
+                            aP.Format.Font.Size = 10;
+                            var ftA = aP.AddFormattedText(WebUtility.HtmlDecode(node.InnerText));
+                            ftA.Color = Color.FromRgb(0, 106, 138);
+                            ftA.Underline = Underline.Single;
+                            break;
+                        case "br":
+                            // line break — skip, paragraphs handle spacing
+                            break;
+                        case "ul":
+                        case "ol":
+                            // Render list items
+                            var items = node.SelectNodes("./li");
+                            if (items != null)
+                            {
+                                int num = 1;
+                                foreach (var li in items)
+                                {
+                                    var liP = cell.AddParagraph();
+                                    liP.Format.LeftIndent = Unit.FromCentimeter(0.5);
+                                    liP.Format.Font.Color = textColor;
+                                    liP.Format.Font.Size = 10;
+                                    liP.Format.SpaceBefore = Unit.FromPoint(2);
+                                    liP.Format.SpaceAfter = Unit.FromPoint(2);
+                                    string prefix = node.Name.ToLower() == "ol" ? $"{num}. " : "• ";
+                                    liP.AddText(prefix + WebUtility.HtmlDecode(li.InnerText.Trim()));
+                                    if (node.Name.ToLower() == "ol") num++;
+                                }
+                            }
+                            break;
+                        default:
+                            // Recurse into container elements (div, span, etc.)
+                            RenderHtmlContentInCell(cell, node.InnerHtml, textColor);
+                            break;
+                    }
+                }
+            }
+        }
+
+        private void RenderInlineContent(Paragraph p, HtmlNode parent, Color textColor)
+        {
+            foreach (var child in parent.ChildNodes)
+            {
+                if (child.NodeType == HtmlNodeType.Text)
+                {
+                    if (!string.IsNullOrWhiteSpace(child.InnerText))
+                        p.AddText(WebUtility.HtmlDecode(child.InnerText));
+                }
+                else if (child.NodeType == HtmlNodeType.Element)
+                {
+                    switch (child.Name.ToLower())
+                    {
+                        case "strong":
+                        case "b":
+                            var ftB = p.AddFormattedText(WebUtility.HtmlDecode(child.InnerText));
+                            ftB.Bold = true;
+                            break;
+                        case "em":
+                        case "i":
+                            var ftI = p.AddFormattedText(WebUtility.HtmlDecode(child.InnerText));
+                            ftI.Italic = true;
+                            break;
+                        case "u":
+                            var ftU = p.AddFormattedText(WebUtility.HtmlDecode(child.InnerText));
+                            ftU.Underline = Underline.Single;
+                            break;
+                        case "a":
+                            var ftA = p.AddFormattedText(WebUtility.HtmlDecode(child.InnerText));
+                            ftA.Color = Color.FromRgb(0, 106, 138);
+                            ftA.Underline = Underline.Single;
+                            break;
+                        case "br":
+                            p.AddLineBreak();
+                            break;
+                        case "img":
+                            string src = child.GetAttributeValue("src", "");
+                            if (!string.IsNullOrEmpty(src))
+                                AddImageToParaSection(HttpUtility.HtmlDecode(src), p.Section);
+                            break;
+                        default:
+                            RenderInlineContent(p, child, textColor); // recurse into spans/divs
+                            break;
+                    }
+                }
+            }
         }
 
         private string GetDefaultIconPath(string title)
@@ -1766,7 +1927,7 @@ namespace PickupAPi.Controllers
 
             Paragraph heading = section.AddParagraph();
             heading.Style = style;
-            heading.Format.Font.Size = isFirst ? 24 : fontSize;
+            heading.Format.Font.Size = isFirstHeading ? 24 : fontSize;
             // Bold rule: H1/H2 bold; H3/H4 not bold
             if (style == "Heading1" || style == "Heading2")
                 heading.Format.Font.Bold = true;
@@ -1800,7 +1961,7 @@ namespace PickupAPi.Controllers
             //heading.AddText(strContext + " " + cleanText);
             heading.AddText(cleanText);
 
-            isFirst = false;
+            isFirstHeading = false;
         }
 
         private void AddParagraph(Section section, HtmlNode node)
