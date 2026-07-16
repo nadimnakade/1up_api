@@ -1206,6 +1206,31 @@ namespace PickupAPi.Controllers
                         case "img":
                             AddImage(section, childNode);
                             break;
+                        case "pre":
+                        case "code":
+                            // Code/snippet blocks — render as monospace text paragraph
+                            var codePara = section.AddParagraph();
+                            codePara.Format.Font.Name = "Courier New";
+                            codePara.Format.Font.Size = 9;
+                            codePara.Format.Font.Color = Colors.Black;
+                            codePara.Format.SpaceBefore = Unit.FromPoint(6);
+                            codePara.Format.SpaceAfter = Unit.FromPoint(6);
+                            codePara.Format.LeftIndent = Unit.FromCentimeter(0.3);
+                            codePara.AddText(WebUtility.HtmlDecode(childNode.InnerText.Trim()));
+                            break;
+                        case "span":
+                            // Spans inside snippet/code divs — output text directly
+                            if (!string.IsNullOrWhiteSpace(childNode.InnerText))
+                            {
+                                var spanPara = section.AddParagraph();
+                                spanPara.Format.Font.Name = "Courier New";
+                                spanPara.Format.Font.Size = 9;
+                                spanPara.Format.SpaceBefore = Unit.FromPoint(1);
+                                spanPara.Format.SpaceAfter = Unit.FromPoint(1);
+                                spanPara.Format.LeftIndent = Unit.FromCentimeter(0.3);
+                                spanPara.AddText(WebUtility.HtmlDecode(childNode.InnerText.Trim()));
+                            }
+                            break;
                         case "div":
                         case "article":
                         case "section":
