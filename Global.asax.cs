@@ -13,6 +13,10 @@ namespace PickupAPi
     {
         protected void Application_Start()
         {
+            // Set font resolver BEFORE any PdfSharp type is loaded
+            PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
+            System.Diagnostics.Debug.WriteLine("[AppStart] Font resolver set to ArialFontResolver");
+
             AreaRegistration.RegisterAllAreas();
             GlobalConfiguration.Configure(WebApiConfig.Register);
             FilterConfig.RegisterGlobalFilters(GlobalFilters.Filters);

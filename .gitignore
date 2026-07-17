@@ -366,3 +366,6 @@ bin
 *.dll
 *.xml
 *.exe
+App_Data
+*.pdf
+prod_live

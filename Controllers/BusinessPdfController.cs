@@ -20,7 +20,6 @@ using System.Web;
 using System.Web.Http;
 using System.Web.Http.Cors;
 using System.Web.Http.Description;
-using System.Web.UI.WebControls.WebParts;
 
 
 namespace PickupAPi.Controllers
@@ -33,6 +32,17 @@ namespace PickupAPi.Controllers
     {
         private static string API_TOKEN = "qstNVgrrO9A6w9byiy2c/n4Cza4lkaOLmXX9KXSx6yH4/0FDSBdOeSnP40bamD7jaJegf5sb0azs9GH1aOALH1qxM74IHURyIdvhC2ijW9tmHyc5TuLG5KOYibNfRaQ0mzMIffNJzcFqff5TtUFb8w==";
 
+        private static readonly HttpClient _sharedHttpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromMinutes(5)
+        };
+
+        static _BusinessPdfController()
+        {
+            // Force font resolver at class-load time — earliest possible point
+            PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
+            Console.WriteLine("[StaticCtor] Font resolver set to ArialFontResolver");
+        }
 
         int mainsrno = 1;
         int subsrno = 1;
@@ -50,10 +60,9 @@ namespace PickupAPi.Controllers
 
             try
             {
-                // Ensure Montserrat font resolver is set before any PDF/font usage
                 if (PdfSharp.Fonts.GlobalFontSettings.FontResolver == null)
                 {
-                    PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.MontserratFontResolver();
+                    PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
                 }
 
                 // Debug: Log the received HTML content
@@ -275,13 +284,18 @@ namespace PickupAPi.Controllers
 
         public byte[] GenerateBusinessPdf(string htmlContent, int coverPageType = 0)
         {
+            // Force-set font resolver (WPFonts may override at assembly load)
+            PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
+            Console.WriteLine($"[GeneratePdf] FontResolver type: {PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().Name}");
+
             Document doc = new Document();
 
             // HtmlAgilityPack document
             var htmlDoc = new HtmlAgilityPack.HtmlDocument();
             if (!string.IsNullOrEmpty(htmlContent))
             {
-                htmlDoc.LoadHtml(htmlContent); // Load the HTML content
+                htmlDoc.LoadHtml(htmlContent);
+                Console.WriteLine($"[GeneratePdf] HTML loaded: {htmlContent.Length} chars, {htmlDoc.DocumentNode.SelectNodes("//*")?.Count ?? 0} nodes");
             }
 
             DefineStyles(doc);
@@ -300,10 +314,10 @@ namespace PickupAPi.Controllers
 
             // Define page setup for content
             PageSetup pageSetup = contentSection.PageSetup;
-            pageSetup.PageWidth = Unit.FromCentimeter(21);    // A4 width
-            pageSetup.PageHeight = Unit.FromCentimeter(29.7); // A4 height
-            pageSetup.TopMargin = Unit.FromCentimeter(2.5);   // Reserve space for header
-            pageSetup.BottomMargin = Unit.FromCentimeter(2.5); // Reserve space for footer
+            pageSetup.PageWidth = Unit.FromCentimeter(21);
+            pageSetup.PageHeight = Unit.FromCentimeter(29.7);
+            pageSetup.TopMargin = Unit.FromCentimeter(2.5);
+            pageSetup.BottomMargin = Unit.FromCentimeter(2.5);
             pageSetup.LeftMargin = Unit.FromCentimeter(2.5);
             pageSetup.RightMargin = Unit.FromCentimeter(2.5);
             pageSetup.HeaderDistance = Unit.FromCentimeter(0.8);
@@ -311,23 +325,31 @@ namespace PickupAPi.Controllers
 
             // Process HTML content (this will populate headings list)
             ProcessHtmlContent(htmlContent, contentSection);
+            Console.WriteLine($"[GeneratePdf] Processed content. Sections: {doc.Sections.Count}, Headings: {headings.Count}");
 
-            // Prepare document so that PageRef fields and bookmark hyperlinks resolve correctly
-            var migraRenderer = new MigraDoc.Rendering.DocumentRenderer(doc);
-            migraRenderer.PrepareDocument();
+            // Render document to PDF
+            var docRenderer = new MigraDoc.Rendering.DocumentRenderer(doc);
+            docRenderer.PrepareDocument();
+            Console.WriteLine($"[GeneratePdf] Prepared document.");
 
             // Now that page numbers are known, populate the index section
             PopulateIndexSection(tocSection, headings);
 
-            // Render document to PDF
-            PdfDocumentRenderer renderer = new PdfDocumentRenderer(true);
-            renderer.Document = doc;
-            renderer.RenderDocument();
+            // Re-prepare after TOC is populated (page refs need recalculation)
+            docRenderer = new MigraDoc.Rendering.DocumentRenderer(doc);
+            docRenderer.PrepareDocument();
+
+            PdfDocumentRenderer pdfRenderer = new PdfDocumentRenderer(true);
+            pdfRenderer.Document = doc;
+            pdfRenderer.RenderDocument();
+            Console.WriteLine($"[GeneratePdf] Rendered. PdfPageCount: {pdfRenderer.PdfDocument.PageCount}");
 
             using (MemoryStream stream = new MemoryStream())
             {
-                renderer.PdfDocument.Save(stream, false);
-                return stream.ToArray();
+                pdfRenderer.PdfDocument.Save(stream, false);
+                byte[] result = stream.ToArray();
+                Console.WriteLine($"[GeneratePdf] PDF saved: {result.Length} bytes");
+                return result;
             }
         }
 
@@ -572,6 +594,69 @@ namespace PickupAPi.Controllers
 
             return Ok(result);
         }
+
+        [HttpGet]
+        [Route("TestMinimalPdf")]
+        public HttpResponseMessage TestMinimalPdf()
+        {
+            try
+            {
+                Console.WriteLine("[TestMinimalPdf] Starting - DirectContent approach...");
+
+                using (MemoryStream stream = new MemoryStream())
+                {
+                    var doc = new iTextSharp.text.Document(iTextSharp.text.PageSize.A4);
+                    var writer = iTextSharp.text.pdf.PdfWriter.GetInstance(doc, stream);
+                    doc.Open();
+
+                    string fontPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "arial.ttf");
+                    var bf = iTextSharp.text.pdf.BaseFont.CreateFont(fontPath, iTextSharp.text.pdf.BaseFont.IDENTITY_H, iTextSharp.text.pdf.BaseFont.EMBEDDED);
+
+                    var cb = writer.DirectContent;
+
+                    cb.BeginText();
+                    cb.SetFontAndSize(bf, 24);
+                    cb.MoveText(50, 750);
+                    cb.ShowText("Hello World - DirectContent Test");
+                    cb.EndText();
+
+                    cb.BeginText();
+                    cb.SetFontAndSize(bf, 14);
+                    cb.MoveText(50, 700);
+                    cb.ShowText("If you can see this text, iTextSharp DirectContent works!");
+                    cb.EndText();
+
+                    Console.WriteLine("[TestMinimalPdf] DirectContent written");
+                    doc.Close();
+
+                    byte[] bytes = stream.ToArray();
+                    Console.WriteLine($"[TestMinimalPdf] PDF generated: {bytes.Length} bytes");
+
+                    string diskPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "TestMinimal_Diag.pdf");
+                    File.WriteAllBytes(diskPath, bytes);
+                    Console.WriteLine($"[TestMinimalPdf] Saved to disk: {diskPath}");
+
+                    var response = new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new ByteArrayContent(bytes)
+                    };
+                    response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                    response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                    {
+                        FileName = "TestMinimal.pdf"
+                    };
+                    return response;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[TestMinimalPdf] EXCEPTION: {ex}");
+                return new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                {
+                    Content = new StringContent(ex.ToString())
+                };
+            }
+        }
         
         private const string API_BASE = "https://apihub.document360.io";
         private const string LANG_CODE = "en";
@@ -579,11 +664,10 @@ namespace PickupAPi.Controllers
         // ─── 1. Resolve article by public URL ───────────────────────────────────────
         private async Task<string> GetArticleByUrl(string articleUrl)
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("api_token", API_TOKEN);
-
             string url = $"{API_BASE}/v2/Articles?url={HttpUtility.UrlEncode(articleUrl)}&isPublished=true";
-            var response = await client.GetAsync(url);
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("api_token", API_TOKEN);
+            var response = await _sharedHttpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
         }
@@ -591,12 +675,10 @@ namespace PickupAPi.Controllers
         // ─── 2. Get all articles belonging to a category ────────────────────────────
         private async Task<string> GetCategoryArticles(string categoryId)
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("api_token", API_TOKEN);
-
-            // Returns the category tree including child_categories and articles[]
             string url = $"{API_BASE}/v2/Categories/{categoryId}";
-            var response = await client.GetAsync(url);
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("api_token", API_TOKEN);
+            var response = await _sharedHttpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
         }
@@ -604,12 +686,10 @@ namespace PickupAPi.Controllers
         // ─── 3. Get full article content (with language) ────────────────────────────
         private async Task<string> GetArticleDetail(string articleId)
         {
-            var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("api_token", API_TOKEN);
-
-            // BUG FIX: include lang code — without it the endpoint may 404 or return no content
             string url = $"{API_BASE}/v2/Articles/{articleId}/{LANG_CODE}";
-            var response = await client.GetAsync(url);
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Add("api_token", API_TOKEN);
+            var response = await _sharedHttpClient.SendAsync(request);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsStringAsync();
         }
@@ -795,6 +875,72 @@ namespace PickupAPi.Controllers
             return response;
         }
 
+        // ─── Image cache ────────────────────────────────────────────────────────────
+        private static readonly string IMAGE_CACHE_DIR =
+            HttpContext.Current != null
+                ? HttpContext.Current.Server.MapPath("~/App_Data/PdfCache/images")
+                : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PdfCache", "images");
+
+        private string GetImageCachePath(string imageUrl)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(imageUrl.Trim().ToLowerInvariant()));
+                string hex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                return Path.Combine(IMAGE_CACHE_DIR, hex);
+            }
+        }
+
+        private string DownloadImageCached(string imageUrl)
+        {
+            string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
+            decodedUrl = CleanUrl(decodedUrl);
+            if (string.IsNullOrEmpty(decodedUrl)) return null;
+
+            string cachePath = GetImageCachePath(decodedUrl);
+
+            if (File.Exists(cachePath))
+                return cachePath;
+
+            try
+            {
+                Directory.CreateDirectory(IMAGE_CACHE_DIR);
+                byte[] data = _sharedHttpClient.GetByteArrayAsync(decodedUrl).GetAwaiter().GetResult();
+                File.WriteAllBytes(cachePath, data);
+                return cachePath;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ImageCache] Failed to download: {decodedUrl} — {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<string> DownloadImageCachedAsync(string imageUrl)
+        {
+            string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
+            decodedUrl = CleanUrl(decodedUrl);
+            if (string.IsNullOrEmpty(decodedUrl)) return null;
+
+            string cachePath = GetImageCachePath(decodedUrl);
+
+            if (File.Exists(cachePath))
+                return cachePath;
+
+            try
+            {
+                Directory.CreateDirectory(IMAGE_CACHE_DIR);
+                byte[] data = await _sharedHttpClient.GetByteArrayAsync(decodedUrl);
+                File.WriteAllBytes(cachePath, data);
+                return cachePath;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ImageCache] Failed to download: {decodedUrl} — {ex.Message}");
+                return null;
+            }
+        }
+
         // ─── Main endpoint ───────────────────────────────────────────────────────────
         [HttpPost]
         [Route("GenerateFromUrl")]
@@ -828,6 +974,8 @@ namespace PickupAPi.Controllers
 
             try
             {
+                PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
+
                 // Step 1 — resolve article from URL
                 var articleRes = await GetArticleByUrl(req.Url);
                 dynamic articleObj = JsonConvert.DeserializeObject(articleRes);
@@ -853,29 +1001,30 @@ namespace PickupAPi.Controllers
                 if (!articleIds.Any())
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found");
 
-                // Step 4 — accumulate HTML
-                var fullHtml = new StringBuilder();
-                foreach (string articleId in articleIds)
+                // Step 4 — fetch articles in parallel
+                var articleTasks = articleIds.Select(async articleId =>
                 {
                     try
                     {
                         var detailRes = await GetArticleDetail(articleId);
                         dynamic detailObj = JsonConvert.DeserializeObject(detailRes);
-
                         string title = (string)detailObj?.data?.title ?? "";
                         string content = (string)detailObj?.data?.html_content ?? "";
-
                         if (!string.IsNullOrWhiteSpace(content))
-                        {
-                            fullHtml.Append($"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>");
-                            fullHtml.Append(content);
-                            fullHtml.Append("<hr style='page-break-after:always;'/>");
-                        }
+                            return $"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>{content}<hr style='page-break-after:always;'/>";
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"[Article] Skipping {articleId}: {ex.Message}");
                     }
+                    return null;
+                }).ToList();
+
+                var results = await Task.WhenAll(articleTasks);
+                var fullHtml = new StringBuilder();
+                foreach (var r in results)
+                {
+                    if (r != null) fullHtml.Append(r);
                 }
 
                 if (fullHtml.Length == 0)
@@ -933,83 +1082,73 @@ namespace PickupAPi.Controllers
             if (string.IsNullOrEmpty(req?.ArticleId))
                 return Request.CreateResponse(HttpStatusCode.BadRequest, "Invalid ArticleId");
 
-            using (var client = new HttpClient())
+            try
             {
-                try
+                var articleRes = await _sharedHttpClient.GetStringAsync(
+                    $"https://kms.cloud.global/api/document/get-article-detail?articleId={req.ArticleId}&lang=en&version-slug=trustedwifi");
+
+                dynamic articleObj = JsonConvert.DeserializeObject(articleRes);
+                string categoryId = articleObj.data.categoryId;
+
+                var categoryRes = await _sharedHttpClient.GetStringAsync(
+                    $"https://kms.cloud.global/api/document/get-category-articles?categoryId={categoryId}&lang=en&version-slug=trustedwifi");
+
+                dynamic categoryObj = JsonConvert.DeserializeObject(categoryRes);
+
+                var articles = categoryObj.data.articles;
+
+                var sortedArticles = ((IEnumerable<dynamic>)articles)
+                    .OrderBy(a => (int)a.order)
+                    .ToList();
+
+                var allHtml = new List<string>();
+
+                foreach (var art in sortedArticles)
                 {
-                    // 🔹 STEP 1: Get article detail
-                    var articleRes = await client.GetStringAsync(
-                        $"https://kms.cloud.global/api/document/get-article-detail?articleId={req.ArticleId}&lang=en&version-slug=trustedwifi");
+                    var res = await _sharedHttpClient.GetStringAsync(
+                        $"https://kms.cloud.global/api/document/get-article-detail?articleId={art.id}&lang=en&version-slug=trustedwifi");
 
-                    dynamic articleObj = JsonConvert.DeserializeObject(articleRes);
-                    string categoryId = articleObj.data.categoryId;
+                    dynamic obj = JsonConvert.DeserializeObject(res);
 
-                    // 🔹 STEP 2: Get all articles in category
-                    var categoryRes = await client.GetStringAsync(
-                        $"https://kms.cloud.global/api/document/get-category-articles?categoryId={categoryId}&lang=en&version-slug=trustedwifi");
+                    string title = obj.data.title;
+                    string html = obj.data.content;
 
-                    dynamic categoryObj = JsonConvert.DeserializeObject(categoryRes);
-
-                    var articles = categoryObj.data.articles;
-
-                    // 🔹 STEP 3: Sort properly
-                    var sortedArticles = ((IEnumerable<dynamic>)articles)
-                        .OrderBy(a => (int)a.order)
-                        .ToList();
-
-                    List<string> allHtml = new List<string>();
-
-                    // 🔹 STEP 4: Fetch each article HTML
-                    foreach (var art in sortedArticles)
+                    if (!string.IsNullOrEmpty(html))
                     {
-                        var res = await client.GetStringAsync(
-                            $"https://kms.cloud.global/api/document/get-article-detail?articleId={art.id}&lang=en&version-slug=trustedwifi");
-
-                        dynamic obj = JsonConvert.DeserializeObject(res);
-
-                        string title = obj.data.title;
-                        string html = obj.data.content;
-
-                        if (!string.IsNullOrEmpty(html))
-                        {
-                            html = $"<h1>{title}</h1>" + html;
-                            allHtml.Add(html);
-                        }
+                        html = $"<h1>{title}</h1>" + html;
+                        allHtml.Add(html);
                     }
+                }
 
-                    // 🔹 STEP 5: Merge HTML
-                    StringBuilder finalHtml = new StringBuilder();
+                StringBuilder finalHtml = new StringBuilder();
 
-                    foreach (var html in allHtml)
+                foreach (var html in allHtml)
+                {
+                    finalHtml.Append("<div style='page-break-before:always'></div>");
+                    finalHtml.Append(html);
+                }
+
+                byte[] pdfBytes = GenerateBusinessPdf(finalHtml.ToString(), 0);
+
+                var response = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(pdfBytes)
+                };
+
+                response.Content.Headers.ContentType =
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+
+                response.Content.Headers.ContentDisposition =
+                    new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
                     {
-                        finalHtml.Append("<div style='page-break-before:always'></div>");
-                        finalHtml.Append(html);
-                    }
-
-                    // 🔹 STEP 6: Generate PDF (your existing method)
-                    byte[] pdfBytes = GenerateBusinessPdf(finalHtml.ToString(), 0);
-
-                    // 🔹 STEP 7: Return response
-                    var response = new HttpResponseMessage(HttpStatusCode.OK)
-                    {
-                        Content = new ByteArrayContent(pdfBytes)
+                        FileName = "FullSection.pdf"
                     };
 
-                    response.Content.Headers.ContentType =
-                        new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-
-                    response.Content.Headers.ContentDisposition =
-                        new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                        {
-                            FileName = "FullSection.pdf"
-                        };
-
-                    return response;
-                }
-                catch (Exception ex)
-                {
-                    return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.Message);
-                }
+                return response;
+            }
+            catch (Exception ex)
+            {
+                return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.Message);
             }
         }
 
@@ -1974,32 +2113,20 @@ namespace PickupAPi.Controllers
 
         private void AddImageToParaSection(string imageUrl, Section section)
         {
-            string tempImagePath = null;
             try
             {
-                string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-                decodedUrl = CleanUrl(decodedUrl); // Assuming you have this
-                string fileName = Path.GetFileName(new Uri(decodedUrl).AbsolutePath);
-                // Using Guid to prevent name collisions
-                tempImagePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + "_" + fileName);
+                string cachedPath = DownloadImageCached(imageUrl);
+                if (cachedPath == null) return;
 
-                using (WebClient client = new WebClient())
-                {
-                    client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-                    client.DownloadFile(decodedUrl, tempImagePath);
-                }
-
-                // --- Get native width ---
                 Unit imageNativeWidth;
-                using (var img = System.Drawing.Image.FromFile(tempImagePath))
+                using (var img = System.Drawing.Image.FromFile(cachedPath))
                 {
                     double widthInPoints = (double)img.Width / img.HorizontalResolution * 72;
                     imageNativeWidth = Unit.FromPoint(widthInPoints);
                 }
 
-                // --- Add image with correct size ---
                 Paragraph paragraph = section.AddParagraph();
-                var image = paragraph.AddImage(tempImagePath);
+                var image = paragraph.AddImage(cachedPath);
                 image.LockAspectRatio = true;
                 paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.5);
                 paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.5);
@@ -2017,8 +2144,6 @@ namespace PickupAPi.Controllers
             {
                 Console.WriteLine($"Error processing image: {ex.Message}");
             }
-            // NO 'finally' BLOCK - The temp file is intentionally left behind
-            // This is a resource leak, but it matches your original code's behavior.
         }
 
         private void ProcessInlineElements(Paragraph para, HtmlNode node, string titleText = null)
@@ -2474,58 +2599,43 @@ namespace PickupAPi.Controllers
         private void AddImageToParagraph(Paragraph para, HtmlNode imgNode, Unit? containerWidthOverride = null)
         {
             var src = imgNode.GetAttributeValue("src", "");
-            if (!string.IsNullOrEmpty(src))
+            if (string.IsNullOrEmpty(src)) return;
+
+            try
             {
-                try
+                string cachedPath = DownloadImageCached(src);
+                if (cachedPath == null) return;
+
+                var image = para.AddImage(cachedPath);
+                image.LockAspectRatio = true;
+                para.Format.SpaceBefore = Unit.FromCentimeter(0.5);
+                para.Format.SpaceAfter = Unit.FromCentimeter(0.5);
+
+                Unit containerWidth;
+                if (containerWidthOverride.HasValue)
                 {
-                    // Use the same approach as the working method
-                    string decodedUrl = HttpUtility.HtmlDecode(src);
-                    decodedUrl = CleanUrl(decodedUrl);
-                    string fileName = Path.GetFileName(new Uri(decodedUrl).AbsolutePath);
-                    string tempPath = Path.Combine(Path.GetTempPath(), fileName);
-
-                    using (var client = new WebClient())
-                    {
-                        client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-                        client.DownloadFile(decodedUrl, tempPath);
-                    }
-
-                    // Add image
-                    var image = para.AddImage(tempPath);
-                    image.LockAspectRatio = true;
-                    para.Format.SpaceBefore = Unit.FromCentimeter(0.5);
-                    para.Format.SpaceAfter = Unit.FromCentimeter(0.5);
-                    // Determine container width: override or usable page width
-                    Unit containerWidth;
-                    if (containerWidthOverride.HasValue)
-                    {
-                        containerWidth = containerWidthOverride.Value;
-                    }
-                    else
-                    {
-                        Section section = para.Section;
-                        Unit pageWidth = section.PageSetup.PageWidth;
-                        Unit leftMargin = section.PageSetup.LeftMargin;
-                        Unit rightMargin = section.PageSetup.RightMargin;
-                        containerWidth = pageWidth - leftMargin - rightMargin;
-                    }
-
-                    // Explicitly set a target width and clamp to container width
-                    Unit targetWidth = Unit.FromCentimeter(15);
-                    if (targetWidth > containerWidth)
-                    {
-                        targetWidth = containerWidth;
-                    }
-                    image.Width = targetWidth;
-
-                    // Center the image
-                    para.Format.Alignment = ParagraphAlignment.Center;
+                    containerWidth = containerWidthOverride.Value;
                 }
-                catch (Exception ex)
+                else
                 {
-                    para.AddText($"[Image could not be loaded] {ex.Message}");
-                    Debug.WriteLine($"Image load error: {ex.Message}");
+                    Section section = para.Section;
+                    Unit pageWidth = section.PageSetup.PageWidth;
+                    Unit leftMargin = section.PageSetup.LeftMargin;
+                    Unit rightMargin = section.PageSetup.RightMargin;
+                    containerWidth = pageWidth - leftMargin - rightMargin;
                 }
+
+                Unit targetWidth = Unit.FromCentimeter(15);
+                if (targetWidth > containerWidth)
+                    targetWidth = containerWidth;
+                image.Width = targetWidth;
+
+                para.Format.Alignment = ParagraphAlignment.Center;
+            }
+            catch (Exception ex)
+            {
+                para.AddText($"[Image could not be loaded] {ex.Message}");
+                Debug.WriteLine($"Image load error: {ex.Message}");
             }
         }
 
@@ -2885,33 +2995,27 @@ namespace PickupAPi.Controllers
                     {
                         try
                         {
-                            string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-                            decodedUrl = CleanUrl(decodedUrl);
-                            string fileName = Path.GetFileName(new Uri(decodedUrl).AbsolutePath);
-                            string tempImagePath = Path.Combine(Path.GetTempPath(), fileName);
-
-                            using (WebClient client = new WebClient())
+                            string cachedPath = DownloadImageCached(imageUrl);
+                            if (cachedPath == null)
                             {
-                                client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-                                client.DownloadFile(decodedUrl, tempImagePath);
+                                var errorPara = cell.AddParagraph();
+                                errorPara.AddText("[Image could not be loaded]");
+                                continue;
                             }
 
                             Paragraph imagePara = cell.AddParagraph();
-                            MigraDoc.DocumentObjectModel.Shapes.Image image = imagePara.AddImage(tempImagePath);
+                            MigraDoc.DocumentObjectModel.Shapes.Image image = imagePara.AddImage(cachedPath);
                             imagePara.Format.SpaceBefore = Unit.FromCentimeter(0.5);
                             imagePara.Format.SpaceAfter = Unit.FromCentimeter(0.5);
-                            // Available width inside this cell
                             int colIndex = cell.Column.Index;
                             Unit colWidth = cell.Table.Columns[colIndex].Width;
-                            Unit maxImageWidth = colWidth - Unit.FromCentimeter(0.2); // padding
+                            Unit maxImageWidth = colWidth - Unit.FromCentimeter(0.2);
 
-                            // Read HTML attributes
                             string width = content.GetAttributeValue("width", "");
                             string height = content.GetAttributeValue("height", "");
 
                             bool sizeSet = false;
 
-                            // Width handling
                             if (!string.IsNullOrEmpty(width))
                             {
                                 if (width.Equals("auto", StringComparison.OrdinalIgnoreCase))
@@ -2922,12 +3026,11 @@ namespace PickupAPi.Controllers
                                 }
                                 else if (int.TryParse(width.Replace("px", ""), out int pxWidth))
                                 {
-                                    image.Width = Unit.FromPoint(pxWidth * 0.75); // px → pt
+                                    image.Width = Unit.FromPoint(pxWidth * 0.75);
                                     sizeSet = true;
                                 }
                             }
 
-                            // Height handling
                             if (!string.IsNullOrEmpty(height))
                             {
                                 if (height.Equals("auto", StringComparison.OrdinalIgnoreCase))
@@ -2936,18 +3039,16 @@ namespace PickupAPi.Controllers
                                 }
                                 else if (int.TryParse(height.Replace("px", ""), out int pxHeight))
                                 {
-                                    image.Height = Unit.FromPoint(pxHeight * 0.75); // px → pt
+                                    image.Height = Unit.FromPoint(pxHeight * 0.75);
                                 }
                             }
 
-                            // If no size specified, fit to column width
                             if (!sizeSet)
                             {
                                 image.LockAspectRatio = true;
                                 image.Width = maxImageWidth;
                             }
 
-                            // Ensure image never exceeds cell width
                             if (image.Width > maxImageWidth)
                             {
                                 image.LockAspectRatio = true;
@@ -2955,15 +3056,6 @@ namespace PickupAPi.Controllers
                             }
 
                             imagePara.Format.Alignment = ParagraphAlignment.Center;
-
-                            try
-                            {
-                                if (File.Exists(tempImagePath))
-                                {
-                                    File.Delete(tempImagePath);
-                                }
-                            }
-                            catch { }
                         }
                         catch (Exception)
                         {
@@ -3289,28 +3381,22 @@ namespace PickupAPi.Controllers
                         {
                             try
                             {
-                                string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-                                string fileName = Path.GetFileName(new Uri(decodedUrl).AbsolutePath);
-                                string tempImagePath = Path.Combine(Path.GetTempPath(), fileName);
-
-                                using (WebClient client = new WebClient())
+                                string cachedPath = DownloadImageCached(imageUrl);
+                                if (cachedPath != null)
                                 {
-                                    client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-                                    client.DownloadFile(decodedUrl, tempImagePath);
-                                }
+                                    var image = paragraph.AddImage(cachedPath);
 
-                                var image = paragraph.AddImage(tempImagePath);
-
-                                int colIndex = cell.Column.Index;
-                                if (colIndex >= 0 && colIndex < cell.Table.Columns.Count)
-                                {
-                                    image.Width = Unit.FromCentimeter(cell.Table.Columns[colIndex].Width.Centimeter - 0.5);
+                                    int colIndex = cell.Column.Index;
+                                    if (colIndex >= 0 && colIndex < cell.Table.Columns.Count)
+                                    {
+                                        image.Width = Unit.FromCentimeter(cell.Table.Columns[colIndex].Width.Centimeter - 0.5);
+                                    }
+                                    else
+                                    {
+                                        image.Width = Unit.FromCentimeter(5);
+                                    }
+                                    image.LockAspectRatio = true;
                                 }
-                                else
-                                {
-                                    image.Width = Unit.FromCentimeter(5);
-                                }
-                                image.LockAspectRatio = true;
                             }
                             catch (Exception ex)
                             {
@@ -3453,8 +3539,7 @@ namespace PickupAPi.Controllers
         private void AddImage(Section section, HtmlNode node)
         {
             string src = node.GetAttributeValue("src", "");
-            if (string.IsNullOrEmpty(src))
-                return;
+            if (string.IsNullOrEmpty(src)) return;
 
             try
             {
@@ -3463,60 +3548,41 @@ namespace PickupAPi.Controllers
 
                 if (src.StartsWith("http") || src.StartsWith("https"))
                 {
-                    // Download external image
-                    using (WebClient client = new WebClient())
-                    {
-                        byte[] imageData = client.DownloadData(src);
-                        string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".png");
-                        File.WriteAllBytes(tempPath, imageData);
+                    string cachedPath = DownloadImageCached(src);
+                    if (cachedPath == null) return;
 
-                        var image = para.AddImage(tempPath);
-                        image.LockAspectRatio = true;
+                    var image = para.AddImage(cachedPath);
+                    image.LockAspectRatio = true;
 
-                        // Compute usable page width (paragraph-level image)
-                        section = para.Section;
-                        Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
+                    section = para.Section;
+                    Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
 
-                        // Default target width of 15cm, but never exceed container width
-                        Unit targetWidth = Unit.FromCentimeter(15);
-                        if (targetWidth > containerWidth)
-                        {
-                            targetWidth = containerWidth;
-                        }
-                        image.Width = targetWidth;
-
-                        // Clean up temp file
-                        File.Delete(tempPath);
-                    }
+                    Unit targetWidth = Unit.FromCentimeter(15);
+                    if (targetWidth > containerWidth)
+                        targetWidth = containerWidth;
+                    image.Width = targetWidth;
                 }
                 else if (src.StartsWith("~/"))
                 {
-                    // Local image
                     string localPath = HttpContext.Current.Server.MapPath(src);
                     if (File.Exists(localPath))
                     {
                         var image = para.AddImage(localPath);
                         image.LockAspectRatio = true;
 
-                        // Compute usable page width (paragraph-level image)
                         section = para.Section;
                         Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
 
-                        // Default target width of 15cm, but never exceed container width
                         Unit targetWidth = Unit.FromCentimeter(15);
                         if (targetWidth > containerWidth)
-                        {
                             targetWidth = containerWidth;
-                        }
                         image.Width = targetWidth;
                     }
                 }
             }
             catch (Exception ex)
             {
-                // Log error and add placeholder text
                 Console.WriteLine($"Error adding image {src}: {ex.Message}");
-
             }
         }
 
