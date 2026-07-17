@@ -34,6 +34,8 @@ namespace PickupAPi
                         );
 
             config.IncludeErrorDetailPolicy = IncludeErrorDetailPolicy.Always;
+
+            SwaggerConfig.Register(config);
         }
 
 

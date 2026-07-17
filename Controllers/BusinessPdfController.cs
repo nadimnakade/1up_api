@@ -1019,7 +1019,7 @@ namespace PickupAPi.Controllers
         {
             // Normal text style
             Style normal = doc.Styles["Normal"];
-            normal.Font.Name = "Montserrat";
+            normal.Font.Name = "Arial";
             normal.Font.Size = 10;
 
             // Heading styles
