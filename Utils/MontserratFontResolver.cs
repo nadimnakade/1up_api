@@ -6,7 +6,7 @@ using PdfSharp.Fonts;
 
 namespace PickupAPi.Utils
 {
-    public class ArialFontResolver : IFontResolver
+    public class ArialFontResolver : IFontResolver, IFontResolverMarker
     {
         public FontResolverInfo ResolveTypeface(string familyName, bool isBold, bool isItalic)
         {

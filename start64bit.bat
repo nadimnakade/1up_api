@@ -1,0 +1,3 @@
+@echo off
+echo Starting 64-bit IIS Express...
+"C:\Program Files\IIS Express\iisexpress.exe" /config:"C:\Users\Nadeem\Documents\IISExpress\config\applicationhost.config" /site:PickupAPi /trace:i

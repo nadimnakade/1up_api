@@ -1,11 +1,11 @@
 using HtmlAgilityPack;
-using Microsoft.Ajax.Utilities;
 using MigraDoc.DocumentObjectModel;
 using MigraDoc.DocumentObjectModel.Shapes;
 using MigraDoc.DocumentObjectModel.Tables;
 using MigraDoc.Rendering;
 using Newtonsoft.Json;
 using PickupAPi.Models;
+using PickupAPi.Utils;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -13,42 +13,189 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web;
+using System.Web.Hosting;
 using System.Web.Http;
 using System.Web.Http.Cors;
 using System.Web.Http.Description;
 
-
 namespace PickupAPi.Controllers
 {
-    
-
-    //[EnableCors(origins: "https://nomadix-kms.document360.io", headers: "*", methods: "*")]
     [RoutePrefix("api/BusinessPdf")]
     public class _BusinessPdfController : ApiController
     {
-        private static string API_TOKEN = "qstNVgrrO9A6w9byiy2c/n4Cza4lkaOLmXX9KXSx6yH4/0FDSBdOeSnP40bamD7jaJegf5sb0azs9GH1aOALH1qxM74IHURyIdvhC2ijW9tmHyc5TuLG5KOYibNfRaQ0mzMIffNJzcFqff5TtUFb8w==";
-
-        private static readonly HttpClient _sharedHttpClient = new HttpClient
+        public class UrlRequestModel
         {
-            Timeout = TimeSpan.FromMinutes(5)
-        };
-
-        static _BusinessPdfController()
-        {
-            // Force font resolver at class-load time — earliest possible point
-            PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
-            Console.WriteLine("[StaticCtor] Font resolver set to ArialFontResolver");
+            public string Url { get; set; }
+            public bool? ForceRefresh { get; set; } = false;
         }
 
-        int mainsrno = 1;
-        int subsrno = 1;
+        private static string API_TOKEN = "qstNVgrrO9A6w9byiy2c/n4Cza4lkaOLmXX9KXSx6yH4/0FDSBdOeSnP40bamD7jaJegf5sb0azs9GH1aOALH1qxM74IHURyIdvhC2ijW9tmHyc5TuLG5KOYibNfRaQ0mzMIffNJzcFqff5TtUFb8w==";
+
+        private int mainsrno = 1;
+        private int subsrno = 1;
         private readonly List<(string Title, int PageNumber)> blockquoteIndex = new List<(string, int)>();
         private List<(string Title, string Bookmark, string Level)> headings;
-        bool isFirst = true;
+        private bool isFirst = true;
+
+        private const string API_BASE = "https://apihub.document360.io";
+        private const string LANG_CODE = "en";
+
+        private static readonly string PDF_CACHE_DIR = HttpContext.Current != null
+            ? HttpContext.Current.Server.MapPath("~/App_Data/PdfCache")
+            : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PdfCache");
+
+        private static readonly string IMAGE_CACHE_DIR = HttpContext.Current != null
+            ? HttpContext.Current.Server.MapPath("~/App_Data/PdfCache/images")
+            : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PdfCache", "images");
+
+        private List<int> headingNumbers = new List<int>();
+
+        // Change #2: Use ArialFontResolver instead of MontserratFontResolver
+        static _BusinessPdfController()
+        {
+            PdfSharp.Fonts.GlobalFontSettings.FontResolver = new ArialFontResolver();
+        }
+
+        // =========================================================================
+        // DIAGNOSTIC ENDPOINT
+        // =========================================================================
+
+        [HttpGet]
+        [Route("Diag")]
+        public HttpResponseMessage Diag()
+        {
+            var info = new System.Text.StringBuilder();
+            info.AppendLine("=== DIAGNOSTIC ===");
+            info.AppendLine("DateTime: " + DateTime.Now);
+            info.AppendLine("Is64BitProcess: " + Environment.Is64BitProcess);
+            info.AppendLine("CLR: " + Environment.Version);
+            info.AppendLine("FontResolver: " + (PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().FullName ?? "NULL"));
+
+            try
+            {
+                var fontResolver = new ArialFontResolver();
+                byte[] fontBytes = fontResolver.GetFont("Arial#Regular");
+                info.AppendLine("Arial#Regular loaded: " + (fontBytes != null ? fontBytes.Length + " bytes" : "NULL"));
+            }
+            catch (Exception ex)
+            {
+                info.AppendLine("Arial#Regular ERROR: " + ex.Message);
+            }
+
+            try
+            {
+                var doc = new MigraDoc.DocumentObjectModel.Document();
+                var style = doc.Styles["Normal"];
+                style.Font.Name = "Arial";
+                style.Font.Size = 10;
+
+                var section = doc.AddSection();
+                section.PageSetup.PageWidth = Unit.FromCentimeter(21.0);
+                section.PageSetup.PageHeight = Unit.FromCentimeter(29.7);
+
+                var para = section.AddParagraph("Hello World - Diagnostic Test");
+                para.Format.Font.Size = 24;
+
+                var renderer = new DocumentRenderer(doc);
+                renderer.PrepareDocument();
+                info.AppendLine("DocumentRenderer.PageCount: " + renderer.FormattedDocument.PageCount);
+
+                var pdfRenderer = new PdfDocumentRenderer(unicode: true);
+                pdfRenderer.Document = doc;
+                pdfRenderer.RenderDocument();
+
+                using (var ms = new MemoryStream())
+                {
+                    pdfRenderer.PdfDocument.Save(ms, closeStream: false);
+                    byte[] bytes = ms.ToArray();
+                    info.AppendLine("PDF bytes: " + bytes.Length);
+
+                    // Save to disk for manual inspection
+                    string diagPath = HttpContext.Current.Server.MapPath("~/App_Data/PdfCache/diag_test.pdf");
+                    Directory.CreateDirectory(Path.GetDirectoryName(diagPath));
+                    File.WriteAllBytes(diagPath, bytes);
+                    info.AppendLine("Saved to: " + diagPath);
+
+                    HttpResponseMessage response = new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new ByteArrayContent(bytes)
+                    };
+                    response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                    return response;
+                }
+            }
+            catch (Exception ex)
+            {
+                info.AppendLine("PDF GENERATION ERROR: " + ex);
+            }
+
+            HttpResponseMessage textResponse = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(info.ToString(), Encoding.UTF8, "text/plain")
+            };
+            return textResponse;
+        }
+
+        [HttpGet]
+        [Route("DiagHtml")]
+        public HttpResponseMessage DiagHtml()
+        {
+            string testHtml = "<h1>Test Heading 1</h1><p>This is a test paragraph with <b>bold text</b> and normal text.</p><h2>Test Heading 2</h2><p>Another paragraph under heading 2.</p><ul><li>Item 1</li><li>Item 2</li></ul>";
+
+            try
+            {
+                Console.WriteLine("[DiagHtml] Generating PDF with test HTML...");
+                Console.WriteLine("[DiagHtml] FontResolver type: " + (PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().FullName ?? "NULL"));
+                Console.WriteLine("[DiagHtml] Is64BitProcess: " + Environment.Is64BitProcess);
+
+                byte[] pdfBytes = GenerateBusinessPdf(testHtml);
+                Console.WriteLine("[DiagHtml] PDF generated: " + pdfBytes.Length + " bytes");
+
+                HttpResponseMessage response = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(pdfBytes)
+                };
+                response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                {
+                    FileName = "diag_html_test.pdf"
+                };
+                return response;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[DiagHtml] ERROR: " + ex);
+                HttpResponseMessage textResponse = new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                {
+                    Content = new StringContent("ERROR: " + ex.ToString(), Encoding.UTF8, "text/plain")
+                };
+                return textResponse;
+            }
+        }
+
+        [HttpGet]
+        [Route("DiagInfo")]
+        public IHttpActionResult DiagInfo()
+        {
+            var info = new
+            {
+                Is64BitProcess = Environment.Is64BitProcess,
+                CLRVersion = Environment.Version.ToString(),
+                FontResolverType = PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().FullName ?? "NULL",
+                OSVersion = Environment.OSVersion.ToString(),
+                MachineName = Environment.MachineName
+            };
+            return Ok(info);
+        }
+
+        // =========================================================================
+        // ENDPOINTS
+        // =========================================================================
 
         [HttpPost]
         [Route("GeneratePdf")]
@@ -61,30 +208,20 @@ namespace PickupAPi.Controllers
             try
             {
                 if (PdfSharp.Fonts.GlobalFontSettings.FontResolver == null)
+                    PdfSharp.Fonts.GlobalFontSettings.FontResolver = new ArialFontResolver();
+
+                byte[] array = GenerateBusinessPdf(request.htmlContent, request.CoverPageType);
+
+                HttpResponseMessage val = new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
-                }
-
-                // Debug: Log the received HTML content
-                Console.WriteLine($"Received HTML content length: {request.htmlContent?.Length ?? 0}");
-                Console.WriteLine($"HTML content preview: {request.htmlContent?.Substring(0, Math.Min(200, request.htmlContent?.Length ?? 0))}");
-
-                string strHTMLContent = request.htmlContent;
-
-
-                byte[] pdfBytes = GenerateBusinessPdf(request.htmlContent, request.CoverPageType);
-
-                HttpResponseMessage response = new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new ByteArrayContent(pdfBytes)
+                    Content = (HttpContent)new ByteArrayContent(array)
                 };
-                response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-                response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                val.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                val.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
                 {
                     FileName = "NomadixBusinessDocument.pdf"
                 };
-
-                return response;
+                return val;
             }
             catch (Exception ex)
             {
@@ -92,627 +229,122 @@ namespace PickupAPi.Controllers
             }
         }
 
-
-        private void PopulateIndexSection(Section indexSection, List<(string Title, string Bookmark, string Level)> headings)
-        {
-            // Validate input parameters
-            if (indexSection == null || headings == null || !headings.Any())
-            {
-                return; // Exit if no headings to index
-            }
-
-            // Set up page formatting
-            indexSection.PageSetup = new PageSetup
-            {
-                PageWidth = Unit.FromCentimeter(21),    // A4 width
-                PageHeight = Unit.FromCentimeter(29.7),  // A4 height
-                TopMargin = Unit.FromCentimeter(2.5),
-                BottomMargin = Unit.FromCentimeter(2.5),
-                LeftMargin = Unit.FromCentimeter(2.5),
-                RightMargin = Unit.FromCentimeter(2.5)
-            };
-
-            // Add header and footer to index page
-            //AddHeader(indexSection);
-            //AddFooter(indexSection);
-
-            // Add title with enhanced styling
-            Paragraph title = indexSection.AddParagraph("Table of Contents");
-            title.Format.Font.Size = 16;
-            title.Format.Font.Bold = true;
-            title.Format.Font.Color = Color.FromRgb(81, 162, 198); // Match heading color
-            title.Format.Alignment = ParagraphAlignment.Center;
-            title.Format.SpaceAfter = Unit.FromCentimeter(0.5);
-            title.Format.SpaceBefore = Unit.FromCentimeter(0.5);
-
-            // Add a decorative line under the title
-            Paragraph line = indexSection.AddParagraph();
-            line.Format.Borders.Bottom.Width = 1;
-            line.Format.Borders.Bottom.Color = Color.FromRgb(81, 162, 198);
-            line.Format.SpaceAfter = Unit.FromCentimeter(1);
-
-            // Create a table for the index entries
-            Table indexTable = indexSection.AddTable();
-            indexTable.Borders.Visible = false;
-            indexTable.AddColumn(Unit.FromCentimeter(1.5));  // Number column
-            indexTable.AddColumn(Unit.FromCentimeter(12));   // Title column
-            indexTable.AddColumn(Unit.FromCentimeter(2.5));  // Page number column
-
-            // Add table header
-            Row headerRow = indexTable.AddRow();
-            headerRow.HeadingFormat = true;
-            headerRow.Format.Font.Bold = true;
-            headerRow.Format.Font.Size = 12;
-            headerRow.Shading.Color = Color.FromRgb(240, 240, 240);
-            headerRow.Format.SpaceAfter = Unit.FromCentimeter(0.3);
-            headerRow.Format.SpaceBefore = Unit.FromCentimeter(0.5);
-
-
-            // Ensure a consistent minimum header height
-            headerRow.Height = Unit.FromCentimeter(0.3);
-            headerRow.HeightRule = RowHeightRule.AtLeast;
-
-            // Apply padding / spacing to each header cell for better visual spacing
-            for (int ci = 0; ci < headerRow.Cells.Count; ci++)
-            {
-                var cell = headerRow.Cells[ci];
-                // Horizontal "padding"
-                cell.Format.LeftIndent = Unit.FromCentimeter(0.3);
-                cell.Format.RightIndent = Unit.FromCentimeter(0.3);
-
-                // Vertical spacing inside the cell
-                cell.Format.SpaceBefore = Unit.FromPoint(0.5);
-                cell.Format.SpaceAfter = Unit.FromPoint(0.3);
-
-                // Center cell content vertically
-                cell.VerticalAlignment = VerticalAlignment.Center;
-
-                // Ensure header text alignment defaults are preserved (Page column centered later)
-                cell.Format.Alignment = ParagraphAlignment.Left;
-            }
-
-            headerRow.Cells[0].AddParagraph("#");
-            headerRow.Cells[1].AddParagraph("Section");
-            headerRow.Cells[2].AddParagraph("Page");
-            headerRow.Cells[2].Format.Alignment = ParagraphAlignment.Left;
-
-            // Add headings to the index with hierarchical structure
-            int h2Number = 1;
-            int h3Number = 1;
-
-
-            // Add a blank spacer row at the top of the index entries
-            Row blankRow = indexTable.AddRow();
-            blankRow.Height = Unit.FromCentimeter(0.4);
-            blankRow.HeightRule = RowHeightRule.AtLeast;
-            // Clear any default content and hide borders for the blank row
-            for (int ci = 0; ci < blankRow.Cells.Count; ci++)
-            {
-                blankRow.Cells[ci].AddParagraph(string.Empty);
-                blankRow.Cells[ci].Borders.Visible = false;
-            }
-
-            foreach (var heading in headings)
-            {
-                Row row = indexTable.AddRow();
-                row.Format.Font.Size = 10;
-
-                if (heading.Level == "H2")
-                {
-                    // Reset H3 counter for new H2 section
-                    h3Number = 1;
-
-                    // Section number for H2
-                    Paragraph numberPara = row.Cells[0].AddParagraph(h2Number.ToString());
-                    numberPara.Format.Font.Bold = true;
-                    numberPara.Format.Font.Color = Color.FromRgb(81, 162, 198);
-
-                    // Title with hyperlink for H2
-                    Paragraph titlePara = row.Cells[1].AddParagraph();
-                    Hyperlink hyperlink = titlePara.AddHyperlink(heading.Bookmark, HyperlinkType.Bookmark);
-                    hyperlink.AddText(heading.Title);
-                    hyperlink.Font.Color = Color.FromRgb(51, 51, 51);
-                    hyperlink.Font.Underline = Underline.Single;
-                    hyperlink.Font.Bold = true; // H2 titles are bold
-
-                    h2Number++;
-                }
-                else if (heading.Level == "H3")
-                {
-                    // Subsection number for H3
-                    Paragraph numberPara = row.Cells[0].AddParagraph($"{h2Number - 1}.{h3Number}");
-                    numberPara.Format.Font.Color = Color.FromRgb(120, 120, 120);
-
-                    // Title with hyperlink for H3 (indented)
-                    Paragraph titlePara = row.Cells[1].AddParagraph();
-                    titlePara.Format.LeftIndent = Unit.FromCentimeter(0.8); // Indent H3 titles
-                    Hyperlink hyperlink = titlePara.AddHyperlink(heading.Bookmark, HyperlinkType.Bookmark);
-                    hyperlink.AddText(heading.Title);
-                    hyperlink.Font.Color = Color.FromRgb(80, 80, 80);
-                    hyperlink.Font.Underline = Underline.Single;
-
-                    h3Number++;
-                }
-                // Page number reference - make the page number clickable to the same bookmark
-                Paragraph pagePara = row.Cells[2].AddParagraph();
-
-                // Create a bookmark hyperlink and add a PageRef field inside it so the displayed page
-                // number is clickable and navigates to the heading bookmark.
-                var pageLink = pagePara.AddHyperlink(heading.Bookmark, HyperlinkType.Bookmark);
-                pageLink.AddPageRefField(heading.Bookmark);
-                pageLink.Font.Color = Color.FromRgb(81, 162, 198);
-                pageLink.Font.Underline = Underline.Single;
-
-                pagePara.Format.Alignment = ParagraphAlignment.Center;
-
-                // Add subtle row spacing
-                row.Format.SpaceBefore = Unit.FromPoint(0.5);
-                row.Format.SpaceAfter = Unit.FromPoint(6);
-            }
-
-            //// Add footer note
-            //Paragraph footerNote = indexSection.AddParagraph();
-            //footerNote.Format.SpaceBefore = Unit.FromCentimeter(2);
-            //footerNote.AddText("Click on any section title to navigate directly to that page.");
-            //footerNote.Format.Font.Size = 8;
-            //footerNote.Format.Font.Italic = true;
-            //footerNote.Format.Font.Color = Colors.Gray;
-            //footerNote.Format.Alignment = ParagraphAlignment.Center;
-        }
-
-        private Section CreateAndInsertTocSection(Document doc)
-        {
-            // Create a new section for the TOC
-            Section tocSection = new Section();
-
-            // Set up page formatting
-            tocSection.PageSetup = new PageSetup
-            {
-                PageWidth = Unit.FromCentimeter(21),    // A4 width
-                PageHeight = Unit.FromCentimeter(29.7),  // A4 height
-                TopMargin = Unit.FromCentimeter(2.5),
-                BottomMargin = Unit.FromCentimeter(2.5),
-                LeftMargin = Unit.FromCentimeter(2.5),
-                RightMargin = Unit.FromCentimeter(2.5)
-            };
-
-            // Insert the TOC section after the cover page (position 1)
-            doc.Sections.InsertObject(1, tocSection);
-
-            return tocSection;
-        }
-
-        public byte[] GenerateBusinessPdf(string htmlContent, int coverPageType = 0)
-        {
-            // Force-set font resolver (WPFonts may override at assembly load)
-            PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
-            Console.WriteLine($"[GeneratePdf] FontResolver type: {PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().Name}");
-
-            Document doc = new Document();
-
-            // HtmlAgilityPack document
-            var htmlDoc = new HtmlAgilityPack.HtmlDocument();
-            if (!string.IsNullOrEmpty(htmlContent))
-            {
-                htmlDoc.LoadHtml(htmlContent);
-                Console.WriteLine($"[GeneratePdf] HTML loaded: {htmlContent.Length} chars, {htmlDoc.DocumentNode.SelectNodes("//*")?.Count ?? 0} nodes");
-            }
-
-            DefineStyles(doc);
-            AddCoverPage(doc);
-
-            // Initialize headings list for index
-            headings = new List<(string Title, string Bookmark, string Level)>();
-
-            // Create and insert the TOC section before processing content
-            Section tocSection = CreateAndInsertTocSection(doc);
-
-            // Add content section with header and footer
-            Section contentSection = doc.AddSection();
-            AddHeader(contentSection);
-            AddFooter(contentSection);
-
-            // Define page setup for content
-            PageSetup pageSetup = contentSection.PageSetup;
-            pageSetup.PageWidth = Unit.FromCentimeter(21);
-            pageSetup.PageHeight = Unit.FromCentimeter(29.7);
-            pageSetup.TopMargin = Unit.FromCentimeter(2.5);
-            pageSetup.BottomMargin = Unit.FromCentimeter(2.5);
-            pageSetup.LeftMargin = Unit.FromCentimeter(2.5);
-            pageSetup.RightMargin = Unit.FromCentimeter(2.5);
-            pageSetup.HeaderDistance = Unit.FromCentimeter(0.8);
-            pageSetup.FooterDistance = Unit.FromCentimeter(0.8);
-
-            // Process HTML content (this will populate headings list)
-            ProcessHtmlContent(htmlContent, contentSection);
-            Console.WriteLine($"[GeneratePdf] Processed content. Sections: {doc.Sections.Count}, Headings: {headings.Count}");
-
-            // Render document to PDF
-            var docRenderer = new MigraDoc.Rendering.DocumentRenderer(doc);
-            docRenderer.PrepareDocument();
-            Console.WriteLine($"[GeneratePdf] Prepared document.");
-
-            // Now that page numbers are known, populate the index section
-            PopulateIndexSection(tocSection, headings);
-
-            // Re-prepare after TOC is populated (page refs need recalculation)
-            docRenderer = new MigraDoc.Rendering.DocumentRenderer(doc);
-            docRenderer.PrepareDocument();
-
-            PdfDocumentRenderer pdfRenderer = new PdfDocumentRenderer(true);
-            pdfRenderer.Document = doc;
-            pdfRenderer.RenderDocument();
-            Console.WriteLine($"[GeneratePdf] Rendered. PdfPageCount: {pdfRenderer.PdfDocument.PageCount}");
-
-            using (MemoryStream stream = new MemoryStream())
-            {
-                pdfRenderer.PdfDocument.Save(stream, false);
-                byte[] result = stream.ToArray();
-                Console.WriteLine($"[GeneratePdf] PDF saved: {result.Length} bytes");
-                return result;
-            }
-        }
-
-
-        private void AddCoverPage(Document doc)
-        {
-            Section section = doc.AddSection();
-            section.PageSetup = new PageSetup
-            {
-                PageWidth = Unit.FromCentimeter(21),    // A4 width
-                PageHeight = Unit.FromCentimeter(29.7),  // A4 height
-                TopMargin = Unit.FromCentimeter(0),
-                BottomMargin = Unit.FromCentimeter(0),
-                LeftMargin = Unit.FromCentimeter(0),
-                RightMargin = Unit.FromCentimeter(0)
-            };
-
-
-            // Add header image (person with phone)
-            var headerImage = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/header-logo.png"));
-            headerImage.Width = section.PageSetup.PageWidth;
-            headerImage.Height = Unit.FromCentimeter(18);
-            headerImage.RelativeVertical = RelativeVertical.Page;
-            headerImage.RelativeHorizontal = RelativeHorizontal.Page;
-            headerImage.Top = Unit.FromCentimeter(0);
-            headerImage.Left = Unit.FromCentimeter(0);
-            headerImage.WrapFormat.Style = WrapStyle.Through;
-
-
-            var middleImage = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/middle.png"));
-            middleImage.Width = section.PageSetup.PageWidth;
-            middleImage.Height = Unit.FromCentimeter(7);
-            middleImage.RelativeVertical = RelativeVertical.Page;
-            middleImage.RelativeHorizontal = RelativeHorizontal.Page;
-            middleImage.Top = Unit.FromCentimeter(19);
-            middleImage.Left = Unit.FromCentimeter(0);
-            middleImage.WrapFormat.Style = WrapStyle.Through;
-
-
-            // Create a table for the footer
-            //section.Headers.Primary.AddImage(HttpContext.Current.Server.MapPath("~/logo/header-image.jpg"));
-            Table footerTable = section.Footers.Primary.AddTable();
-            footerTable.Borders.Width = 0;
-            footerTable.AddColumn(Unit.FromCentimeter(16)); // Text column
-            footerTable.AddColumn(Unit.FromCentimeter(5));  // Logo column
-
-
-            Row footerRow = footerTable.AddRow();
-
-            // Set the background color
-            footerRow.Shading.Color = new Color(122, 181, 92); // Light green background
-
-            // Add the left-aligned text
-            Paragraph leftText = footerRow.Cells[0].AddParagraph();
-            leftText.AddFormattedText("® NOMADIX", TextFormat.Bold);
-            //leftText.Format.Font.Name = "Montserrat";
-            leftText.Format.Font.Size = 11;
-            leftText.Format.Font.Color = Colors.White;
-            leftText.Format.Alignment = ParagraphAlignment.Left;
-            leftText.Format.LeftIndent = Unit.FromCentimeter(0.5); // Adjust left indent
-
-            // Set vertical alignment for the left cell
-            footerRow.Cells[0].VerticalAlignment = VerticalAlignment.Center;
-
-
-
-            // Adjust the height of the row to fit content
-            footerRow.Height = Unit.FromCentimeter(1.4);
-
-
-
-        }
-
-        private void AddCustomCoverPage(Document doc)
-        {
-            Section section = doc.AddSection();
-            section.PageSetup = new PageSetup
-            {
-                PageWidth = Unit.FromCentimeter(21),    // A4 width
-                PageHeight = Unit.FromCentimeter(29.7),  // A4 height
-                TopMargin = Unit.FromCentimeter(0),
-                BottomMargin = Unit.FromCentimeter(0),
-                LeftMargin = Unit.FromCentimeter(0),
-                RightMargin = Unit.FromCentimeter(0)
-            };
-
-            // Add the attached image as full page cover
-            var coverImage = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/pdfbackground.jpg"));
-            coverImage.Width = section.PageSetup.PageWidth;
-            coverImage.Height = section.PageSetup.PageHeight;
-            coverImage.RelativeVertical = RelativeVertical.Page;
-            coverImage.RelativeHorizontal = RelativeHorizontal.Page;
-            coverImage.Top = Unit.FromCentimeter(0);
-            coverImage.Left = Unit.FromCentimeter(0);
-            coverImage.WrapFormat.Style = WrapStyle.Through;
-        }
-
-        private void AddHeader(Section section)
-        {
-            HeaderFooter header = section.Headers.Primary;
-
-            // Create a table for the header
-            Table headerTable = header.AddTable();
-            headerTable.Borders.Width = 0;
-            headerTable.AddColumn(Unit.FromCentimeter(10)); // Title column
-            headerTable.AddColumn(Unit.FromCentimeter(6)); // Logo column
-
-            Row headerRow = headerTable.AddRow();
-
-            // Add title to the left
-            Paragraph titleParagraph = headerRow.Cells[0].AddParagraph("Administration Guide");
-            //titleParagraph.Format.Font.Name = "Montserrat";
-            titleParagraph.Format.Font.Size = 12;
-            titleParagraph.Format.Font.Bold = true;
-            titleParagraph.Format.Alignment = ParagraphAlignment.Left;
-            headerRow.Cells[0].VerticalAlignment = VerticalAlignment.Center;
-
-            // Add logo to the right
-            // Use the existing logo file or create a text placeholder for TrustedWiFi
-            Paragraph logoText = headerRow.Cells[1].AddParagraph("Nomadix");
-            //logoText.Format.Font.Name = "Montserrat";
-            logoText.Format.Font.Size = 14;
-            logoText.Format.Font.Bold = true;
-            logoText.Format.Alignment = ParagraphAlignment.Right;
-            headerRow.Cells[1].VerticalAlignment = VerticalAlignment.Center;
-
-            // Add a horizontal line above the footer
-            Paragraph line = header.AddParagraph();
-            line.Format.Borders.Top.Width = 0.2;
-            line.Format.Borders.Top.Color = Colors.Gray;
-            line.Format.SpaceAfter = Unit.FromCentimeter(0.2);
-        }
-
-        //private void AddFooter(Section section)
-        //{
-        //    HeaderFooter footer = section.Footers.Primary;
-
-        //    // Add 12pt margin between body and footer
-        //    Paragraph spacer = footer.AddParagraph();
-        //    spacer.Format.SpaceBefore = Unit.FromPoint(14);
-
-        //    // Add a horizontal line above the footer
-        //    Paragraph line = footer.AddParagraph();
-        //    line.Format.Borders.Top.Width = 0.05;
-        //    line.Format.Borders.Top.Color = Colors.LightGray;
-
-        //    // Create a table for the footer
-        //    Table footerTable = footer.AddTable();
-        //    footerTable.Borders.Width = 0;
-        //    footerTable.AddColumn(Unit.FromCentimeter(15)); // Main content column
-        //    footerTable.AddColumn(Unit.FromCentimeter(1)); // Page number column
-
-        //    Row footerRow = footerTable.AddRow();
-        //    footerRow.Height = Unit.FromCentimeter(0.8);
-
-        //    // Add year and confidentiality text in one line
-        //    string currentMonthYear = DateTime.Now.ToString("MMMM yyyy");
-        //    Paragraph mainParagraph = footerRow.Cells[0].AddParagraph();
-        //    mainParagraph.Format.TabStops.AddTabStop("3cm");
-        //    mainParagraph.AddText(currentMonthYear);
-        //    mainParagraph.AddTab();
-        //    mainParagraph.AddText("Information subject to change without notice");
-        //    mainParagraph.Format.Font.Size = 8;
-        //    mainParagraph.Format.Font.Color = Colors.Gray; // Lighter gray color
-        //    mainParagraph.Format.Font.Bold = false; // Remove bold for lighter appearance
-        //    mainParagraph.Format.Alignment = ParagraphAlignment.Left;
-        //    footerRow.Cells[0].VerticalAlignment = VerticalAlignment.Center;
-
-        //    // Add page number to the right
-        //    Paragraph pageNumberParagraph = footerRow.Cells[1].AddParagraph();
-        //    pageNumberParagraph.AddPageField();
-        //    pageNumberParagraph.Format.Font.Size = 8;
-        //    pageNumberParagraph.Format.Font.Color = Colors.Gray; // Lighter gray color
-        //    pageNumberParagraph.Format.Font.Bold = false; // Remove bold for lighter appearance
-        //    pageNumberParagraph.Format.Alignment = ParagraphAlignment.Right;
-        //    footerRow.Cells[1].VerticalAlignment = VerticalAlignment.Center;
-        //}
-        private void AddFooter(Section section)
-        {
-            HeaderFooter footer = section.Footers.Primary;
-
-            // Add 12pt margin between body and footer
-            Paragraph spacer = footer.AddParagraph();
-            spacer.Format.SpaceBefore = Unit.FromPoint(14);
-
-            // Add a horizontal line above the footer
-            Paragraph line = footer.AddParagraph();
-            line.Format.Borders.Top.Width = 0.05;
-            line.Format.Borders.Top.Color = Colors.LightGray;
-
-            // Create a table for the footer
-            Table footerTable = footer.AddTable();
-            footerTable.Borders.Width = 0;
-
-            // *** CHANGED: Use 3 columns for 3 distinct alignments ***
-            // (Adjust widths as needed)
-            footerTable.AddColumn(Unit.FromCentimeter(4));  // Column 1: Date (Left-aligned)
-            footerTable.AddColumn(Unit.FromCentimeter(10)); // Column 2: Notice (Center-aligned)
-            footerTable.AddColumn(Unit.FromCentimeter(2));  // Column 3: Page # (Right-aligned)
-
-            Row footerRow = footerTable.AddRow();
-            footerRow.Height = Unit.FromCentimeter(0.8);
-
-            // *** NEW: Cell 0 - Add date (Left-aligned) ***
-            string currentMonthYear = DateTime.Now.ToString("MMMM yyyy");
-            Paragraph dateParagraph = footerRow.Cells[0].AddParagraph();
-            dateParagraph.AddText(currentMonthYear);
-            dateParagraph.Format.Font.Size = 8;
-            dateParagraph.Format.Font.Color = Colors.Gray;
-            dateParagraph.Format.Font.Bold = false;
-            dateParagraph.Format.Alignment = ParagraphAlignment.Left;
-            footerRow.Cells[0].VerticalAlignment = VerticalAlignment.Center;
-
-            // *** NEW: Cell 1 - Add notice (Center-aligned) ***
-            Paragraph noticeParagraph = footerRow.Cells[1].AddParagraph();
-            noticeParagraph.AddText("Information subject to change without notice");
-            noticeParagraph.Format.Font.Size = 8;
-            noticeParagraph.Format.Font.Color = Colors.Gray;
-            noticeParagraph.Format.Font.Bold = false;
-            noticeParagraph.Format.LeftIndent = Unit.FromCentimeter(0.01);
-            noticeParagraph.Format.Alignment = ParagraphAlignment.Center; // <-- Goal achieved
-            footerRow.Cells[1].VerticalAlignment = VerticalAlignment.Center;
-
-            // *** UPDATED: Cell 2 - Add page number (Right-aligned) ***
-            // (Note: This is now Cells[2], not Cells[1])
-            Paragraph pageNumberParagraph = footerRow.Cells[2].AddParagraph();
-            pageNumberParagraph.AddPageField();
-            pageNumberParagraph.Format.Font.Size = 8;
-            pageNumberParagraph.Format.Font.Color = Colors.Gray;
-            pageNumberParagraph.Format.Font.Bold = false;
-            pageNumberParagraph.Format.Alignment = ParagraphAlignment.Right;
-            footerRow.Cells[2].VerticalAlignment = VerticalAlignment.Center;
-        }
-
         [HttpGet]
         [Route("test-article")]
         public async Task<IHttpActionResult> TestArticle()
         {
             string articleUrl = "https://kms.cloud.global/trustedwifi/docs/administration";
-
-            var result = await GetArticleByUrl(articleUrl);
-
-            return Ok(result);
+            return Ok(await GetArticleByUrl(articleUrl));
         }
 
-        [HttpGet]
-        [Route("TestMinimalPdf")]
-        public HttpResponseMessage TestMinimalPdf()
+        // Change #8: PDF Cache
+        [HttpPost]
+        [Route("GenerateFromUrl")]
+        public async Task<HttpResponseMessage> GenerateFromUrl([FromBody] UrlRequestModel req)
         {
+            Debug.WriteLine("[PDF-GFU] === GenerateFromUrl START ===");
+            Debug.WriteLine("[PDF-GFU] URL: " + req?.Url);
+            Debug.WriteLine("[PDF-GFU] ForceRefresh: " + req?.ForceRefresh);
+
+            if (string.IsNullOrWhiteSpace(req?.Url))
+                return Request.CreateResponse(HttpStatusCode.BadRequest, "URL missing");
+
+            string cacheFilePath = GetCacheFilePath(req.Url);
+            byte[] array = req.ForceRefresh.GetValueOrDefault() ? null : TryGetCachedPdf(cacheFilePath);
+            Debug.WriteLine("[PDF-GFU] Cache hit: " + (array != null));
+
+            if (req.ForceRefresh.GetValueOrDefault() && File.Exists(cacheFilePath))
+            {
+                File.Delete(cacheFilePath);
+                Debug.WriteLine("[PDF-GFU] CLEARED cache: " + cacheFilePath);
+            }
+
+            if (array != null)
+            {
+                Debug.WriteLine("[PDF-GFU] Returning CACHED PDF (" + array.Length + " bytes)");
+                string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
+                return BuildPdfResponse(array, fileNameWithoutExtension);
+            }
+
             try
             {
-                Console.WriteLine("[TestMinimalPdf] Starting - DirectContent approach...");
-
-                using (MemoryStream stream = new MemoryStream())
+                Debug.WriteLine("[PDF-GFU] Fetching article from API...");
+                dynamic val = JsonConvert.DeserializeObject(await GetArticleByUrl(req.Url));
+                if (val?.data == null)
                 {
-                    var doc = new iTextSharp.text.Document(iTextSharp.text.PageSize.A4);
-                    var writer = iTextSharp.text.pdf.PdfWriter.GetInstance(doc, stream);
-                    doc.Open();
-
-                    string fontPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "arial.ttf");
-                    var bf = iTextSharp.text.pdf.BaseFont.CreateFont(fontPath, iTextSharp.text.pdf.BaseFont.IDENTITY_H, iTextSharp.text.pdf.BaseFont.EMBEDDED);
-
-                    var cb = writer.DirectContent;
-
-                    cb.BeginText();
-                    cb.SetFontAndSize(bf, 24);
-                    cb.MoveText(50, 750);
-                    cb.ShowText("Hello World - DirectContent Test");
-                    cb.EndText();
-
-                    cb.BeginText();
-                    cb.SetFontAndSize(bf, 14);
-                    cb.MoveText(50, 700);
-                    cb.ShowText("If you can see this text, iTextSharp DirectContent works!");
-                    cb.EndText();
-
-                    Console.WriteLine("[TestMinimalPdf] DirectContent written");
-                    doc.Close();
-
-                    byte[] bytes = stream.ToArray();
-                    Console.WriteLine($"[TestMinimalPdf] PDF generated: {bytes.Length} bytes");
-
-                    string diskPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "TestMinimal_Diag.pdf");
-                    File.WriteAllBytes(diskPath, bytes);
-                    Console.WriteLine($"[TestMinimalPdf] Saved to disk: {diskPath}");
-
-                    var response = new HttpResponseMessage(HttpStatusCode.OK)
-                    {
-                        Content = new ByteArrayContent(bytes)
-                    };
-                    response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-                    response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                    {
-                        FileName = "TestMinimal.pdf"
-                    };
-                    return response;
+                    Debug.WriteLine("[PDF-GFU] Article not found!");
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found");
                 }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[TestMinimalPdf] EXCEPTION: {ex}");
-                return new HttpResponseMessage(HttpStatusCode.InternalServerError)
+
+                string text = (string)val.data.category_id;
+                Debug.WriteLine("[PDF-GFU] Category ID: " + text);
+                if (string.IsNullOrEmpty(text))
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article has no category_id");
+
+                dynamic val2 = JsonConvert.DeserializeObject(await GetCategoryArticles(text));
+                if (val2?.data == null)
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Category not found");
+
+                string categoryName = ((string)val2.data.name) ?? "Section";
+                List<string> list = ExtractArticleIds(val2.data);
+                Debug.WriteLine("[PDF-GFU] Articles in category: " + list.Count);
+                if (!list.Any())
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found");
+
+                StringBuilder fullHtml = new StringBuilder();
+                foreach (string articleId in list)
                 {
-                    Content = new StringContent(ex.ToString())
+                    try
+                    {
+                        object obj = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
+                        string value = ((string)((dynamic)obj)?.data?.title) ?? "";
+                        string value2 = ((string)((dynamic)obj)?.data?.html_content) ?? "";
+                        Debug.WriteLine("[PDF-GFU] Article " + articleId + " title='" + value + "' html_len=" + (value2?.Length ?? 0));
+                        if (!string.IsNullOrWhiteSpace(value2))
+                        {
+                            fullHtml.Append("<h1>" + WebUtility.HtmlEncode(value) + "</h1>");
+                            fullHtml.Append(value2);
+                            fullHtml.Append("<hr style='page-break-after:always;'/>");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine("[PDF-GFU] Skipping article " + articleId + ": " + ex.Message);
+                    }
+                }
+
+                Debug.WriteLine("[PDF-GFU] Total HTML length: " + fullHtml.Length);
+                if (fullHtml.Length == 0)
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No content retrieved");
+
+                Debug.WriteLine("[PDF-GFU] Calling GenerateBusinessPdf...");
+                byte[] pdfBytes = GenerateBusinessPdf(fullHtml.ToString());
+                Debug.WriteLine("[PDF-GFU] PDF generated: " + pdfBytes.Length + " bytes");
+                SavePdfToCache(cacheFilePath, pdfBytes);
+
+                var response = Request.CreateResponse(HttpStatusCode.OK);
+                response.Content = new ByteArrayContent(pdfBytes);
+                response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                response.Content.Headers.ContentLength = pdfBytes.Length;
+                response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("inline")
+                {
+                    FileName = categoryName + ".pdf"
                 };
+                return response;
+            }
+            catch (HttpRequestException ex)
+            {
+                Debug.WriteLine("[PDF-GFU] HttpRequestException: " + ex.Message);
+                return Request.CreateErrorResponse(HttpStatusCode.BadGateway, "Document360 API unreachable: " + ex.Message);
+            }
+            catch (Exception ex2)
+            {
+                Debug.WriteLine("[PDF-GFU] Exception: " + ex2);
+                return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex2.Message);
             }
         }
-        
-        private const string API_BASE = "https://apihub.document360.io";
-        private const string LANG_CODE = "en";
 
-        // ─── 1. Resolve article by public URL ───────────────────────────────────────
-        private async Task<string> GetArticleByUrl(string articleUrl)
-        {
-            string url = $"{API_BASE}/v2/Articles?url={HttpUtility.UrlEncode(articleUrl)}&isPublished=true";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("api_token", API_TOKEN);
-            var response = await _sharedHttpClient.SendAsync(request);
-            response.EnsureSuccessStatusCode();
-            return await response.Content.ReadAsStringAsync();
-        }
-
-        // ─── 2. Get all articles belonging to a category ────────────────────────────
-        private async Task<string> GetCategoryArticles(string categoryId)
-        {
-            string url = $"{API_BASE}/v2/Categories/{categoryId}";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("api_token", API_TOKEN);
-            var response = await _sharedHttpClient.SendAsync(request);
-            response.EnsureSuccessStatusCode();
-            return await response.Content.ReadAsStringAsync();
-        }
-
-        // ─── 3. Get full article content (with language) ────────────────────────────
-        private async Task<string> GetArticleDetail(string articleId)
-        {
-            string url = $"{API_BASE}/v2/Articles/{articleId}/{LANG_CODE}";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("api_token", API_TOKEN);
-            var response = await _sharedHttpClient.SendAsync(request);
-            response.EnsureSuccessStatusCode();
-            return await response.Content.ReadAsStringAsync();
-        }
-
-        // ─── 4. Flatten nested category tree into a flat article ID list ─────────────
-        private List<string> ExtractArticleIds(dynamic categoryData)
-        {
-            var ids = new List<string>();
-
-            // Articles directly in this category
-            if (categoryData.articles != null)
-                foreach (var a in categoryData.articles)
-                    ids.Add((string)a.id);
-
-            // Recurse into child categories
-            if (categoryData.child_categories != null)
-                foreach (var child in categoryData.child_categories)
-                    ids.AddRange(ExtractArticleIds(child));
-
-            return ids;
-        }
-
-        // ─── 5. Main endpoint ────────────────────────────────────────────────────────
+        // Change #9: Keep old endpoint
         [HttpPost]
         [Route("GenerateFromUrl_Old")]
         public async Task<HttpResponseMessage> GenerateFromUrl_Old([FromBody] UrlRequestModel req)
@@ -722,334 +354,71 @@ namespace PickupAPi.Controllers
 
             try
             {
-                // Step 1 — resolve article from URL
-                var articleRes = await GetArticleByUrl(req.Url);
-                dynamic articleObj = JsonConvert.DeserializeObject(articleRes);
-
-                if (articleObj?.data == null)
+                dynamic val = JsonConvert.DeserializeObject(await GetArticleByUrl(req.Url));
+                if (val?.data == null)
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found for the given URL");
 
-                // ✅ BUG FIX: use category_id, NOT id
-                string categoryId = (string)articleObj.data.category_id;
-
-                if (string.IsNullOrEmpty(categoryId))
+                string text = (string)val.data.category_id;
+                if (string.IsNullOrEmpty(text))
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "Article has no category_id");
 
-                // Step 2 — fetch full category tree
-                var categoryRes = await GetCategoryArticles(categoryId);
-                dynamic categoryObj = JsonConvert.DeserializeObject(categoryRes);
-
+                dynamic categoryObj = JsonConvert.DeserializeObject(await GetCategoryArticles(text));
                 if (categoryObj?.data == null)
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "Category not found");
 
-                // Step 3 — flatten all article IDs from the category tree
-                List<string> articleIds = ExtractArticleIds(categoryObj.data);
-
-                if (!articleIds.Any())
+                List<string> list = ExtractArticleIds(categoryObj.data);
+                if (!list.Any())
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found in category");
 
-                // Step 4 — fetch each article's content and accumulate HTML
-                var fullHtml = new StringBuilder();
-                foreach (string articleId in articleIds)
+                StringBuilder fullHtml = new StringBuilder();
+                foreach (string articleId in list)
                 {
                     try
                     {
-                        var detailRes = await GetArticleDetail(articleId);
-                        dynamic detailObj = JsonConvert.DeserializeObject(detailRes);
-
-                        string title = (string)detailObj?.data?.title ?? "";
-                        string content = (string)detailObj?.data?.html_content ?? "";
-
-                        if (!string.IsNullOrWhiteSpace(content))
+                        object obj = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
+                        string value = ((string)((dynamic)obj)?.data?.title) ?? "";
+                        string value2 = ((string)((dynamic)obj)?.data?.html_content) ?? "";
+                        if (!string.IsNullOrWhiteSpace(value2))
                         {
-                            // Wrap each article with a heading so the PDF has clear separation
-                            fullHtml.Append($"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>");
-                            fullHtml.Append(content);
+                            fullHtml.Append("<h1>" + WebUtility.HtmlEncode(value) + "</h1>");
+                            fullHtml.Append(value2);
                             fullHtml.Append("<hr style='page-break-after:always;'/>");
                         }
                     }
-                    catch (Exception articleEx)
+                    catch (Exception ex)
                     {
-                        // Skip articles that fail individually — don't abort the whole export
-                        Console.WriteLine($"Skipping article {articleId}: {articleEx.Message}");
+                        Console.WriteLine("Skipping article " + articleId + ": " + ex.Message);
                     }
                 }
 
                 if (fullHtml.Length == 0)
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "No content could be retrieved");
 
-                // Step 5 — generate PDF
-                byte[] pdfBytes = GenerateBusinessPdf(fullHtml.ToString(), 0);
-
-                string categoryName = (string)categoryObj.data.name ?? "Section";
-                string safeFileName = string.Concat(categoryName.Split(Path.GetInvalidFileNameChars()));
-
-                var response = new HttpResponseMessage(HttpStatusCode.OK);
-                response.Content = new ByteArrayContent(pdfBytes);
-                response.Content.Headers.ContentType =
-                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-                response.Content.Headers.ContentDisposition =
-                    new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                    {
-                        FileName = $"{safeFileName}.pdf"
-                    };
-                return response;
-            }
-            catch (HttpRequestException httpEx)
-            {
-                return Request.CreateErrorResponse(HttpStatusCode.BadGateway,
-                    $"Document360 API unreachable: {httpEx.Message}");
-            }
-            catch (Exception ex)
-            {
-                return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.Message);
-            }
-        }
-
-        // ─── Cache folder (set once, reuse everywhere) ───────────────────────────────
-        private static readonly string PDF_CACHE_DIR =
-            HttpContext.Current != null
-                ? HttpContext.Current.Server.MapPath("~/App_Data/PdfCache")
-                : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PdfCache");
-
-        // ─── Helper: build a deterministic, safe file path from a URL ───────────────
-        private string GetCacheFilePath(string articleUrl)
-        {
-            // SHA256 the URL so any URL becomes a safe, unique, fixed-length filename
-            var sha = System.Security.Cryptography.SHA256.Create();
-            byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(articleUrl.Trim().ToLowerInvariant()));
-            string hashHex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-            return Path.Combine(PDF_CACHE_DIR, $"{hashHex}.pdf");
-        }
-
-        // ─── Helper: read cached PDF (returns null if not cached) ───────────────────
-        private byte[] TryGetCachedPdf(string filePath)
-        {
-            try
-            {
-                if (File.Exists(filePath))
+                byte[] array = GenerateBusinessPdf(fullHtml.ToString());
+                string text2 = ((string)categoryObj.data.name) ?? "Section";
+                string text3 = string.Concat(text2.Split(Path.GetInvalidFileNameChars()));
+                HttpResponseMessage val2 = new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Console.WriteLine($"[PDF Cache] HIT → {filePath}");
-                    return File.ReadAllBytes(filePath);
-                }
-            }
-            catch (Exception ex)
-            {
-                // Cache read failure is non-fatal — just regenerate
-                Console.WriteLine($"[PDF Cache] Read error: {ex.Message}");
-            }
-            return null;
-        }
-
-        // ─── Helper: persist PDF to disk ────────────────────────────────────────────
-        private void SavePdfToCache(string filePath, byte[] pdfBytes)
-        {
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
-                File.WriteAllBytes(filePath, pdfBytes);
-                Console.WriteLine($"[PDF Cache] SAVED → {filePath}");
-            }
-            catch (Exception ex)
-            {
-                // Cache write failure is non-fatal — response still goes out fine
-                Console.WriteLine($"[PDF Cache] Write error: {ex.Message}");
-            }
-        }
-
-        // ─── Helper: build the HttpResponseMessage from raw bytes ───────────────────
-        private HttpResponseMessage BuildPdfResponse(byte[] pdfBytes, string categoryName)
-        {
-            string safeFileName = string.Concat(
-                (categoryName ?? "Section").Split(Path.GetInvalidFileNameChars()));
-
-            var response = new HttpResponseMessage(HttpStatusCode.OK);
-            response.Content = new ByteArrayContent(pdfBytes);
-            response.Content.Headers.ContentType =
-                new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-            response.Content.Headers.ContentDisposition =
-                new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                {
-                    FileName = $"{safeFileName}.pdf"
+                    Content = (HttpContent)new ByteArrayContent(array)
                 };
-            return response;
-        }
-
-        // ─── Image cache ────────────────────────────────────────────────────────────
-        private static readonly string IMAGE_CACHE_DIR =
-            HttpContext.Current != null
-                ? HttpContext.Current.Server.MapPath("~/App_Data/PdfCache/images")
-                : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PdfCache", "images");
-
-        private string GetImageCachePath(string imageUrl)
-        {
-            using (var sha = System.Security.Cryptography.SHA256.Create())
-            {
-                byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(imageUrl.Trim().ToLowerInvariant()));
-                string hex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-                return Path.Combine(IMAGE_CACHE_DIR, hex);
-            }
-        }
-
-        private string DownloadImageCached(string imageUrl)
-        {
-            string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-            decodedUrl = CleanUrl(decodedUrl);
-            if (string.IsNullOrEmpty(decodedUrl)) return null;
-
-            string cachePath = GetImageCachePath(decodedUrl);
-
-            if (File.Exists(cachePath))
-                return cachePath;
-
-            try
-            {
-                Directory.CreateDirectory(IMAGE_CACHE_DIR);
-                byte[] data = _sharedHttpClient.GetByteArrayAsync(decodedUrl).GetAwaiter().GetResult();
-                File.WriteAllBytes(cachePath, data);
-                return cachePath;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ImageCache] Failed to download: {decodedUrl} — {ex.Message}");
-                return null;
-            }
-        }
-
-        private async Task<string> DownloadImageCachedAsync(string imageUrl)
-        {
-            string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-            decodedUrl = CleanUrl(decodedUrl);
-            if (string.IsNullOrEmpty(decodedUrl)) return null;
-
-            string cachePath = GetImageCachePath(decodedUrl);
-
-            if (File.Exists(cachePath))
-                return cachePath;
-
-            try
-            {
-                Directory.CreateDirectory(IMAGE_CACHE_DIR);
-                byte[] data = await _sharedHttpClient.GetByteArrayAsync(decodedUrl);
-                File.WriteAllBytes(cachePath, data);
-                return cachePath;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ImageCache] Failed to download: {decodedUrl} — {ex.Message}");
-                return null;
-            }
-        }
-
-        // ─── Main endpoint ───────────────────────────────────────────────────────────
-        [HttpPost]
-        [Route("GenerateFromUrl")]
-        public async Task<HttpResponseMessage> GenerateFromUrl([FromBody] UrlRequestModel req)
-        {
-            if (string.IsNullOrWhiteSpace(req?.Url))
-                return Request.CreateResponse(HttpStatusCode.BadRequest, "URL missing");
-
-            // ✅ Check cache BEFORE hitting Document360 API
-            string cacheFilePath = GetCacheFilePath(req.Url);
-            //byte[] cachedPdf = TryGetCachedPdf(cacheFilePath);
-            byte[] cachedPdf = (req.ForceRefresh == true) ? null : TryGetCachedPdf(cacheFilePath);
-
-
-            // Wipe stale cache file when force-refreshing
-            if (req.ForceRefresh == true && File.Exists(cacheFilePath))
-            {
-                File.Delete(cacheFilePath);
-                Console.WriteLine($"[PDF Cache] CLEARED (force refresh) → {cacheFilePath}");
-            }
-
-
-            if (cachedPdf != null)
-            {
-                // Derive a display name from the URL path segment as we don't have
-                // the API category name at this point (it was never fetched)
-                string cachedName = Path.GetFileNameWithoutExtension(
-                    new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
-                return BuildPdfResponse(cachedPdf, cachedName);
-            }
-
-            try
-            {
-                PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
-
-                // Step 1 — resolve article from URL
-                var articleRes = await GetArticleByUrl(req.Url);
-                dynamic articleObj = JsonConvert.DeserializeObject(articleRes);
-
-                if (articleObj?.data == null)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found");
-
-                string categoryId = (string)articleObj.data.category_id;
-                if (string.IsNullOrEmpty(categoryId))
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article has no category_id");
-
-                // Step 2 — fetch category tree
-                var categoryRes = await GetCategoryArticles(categoryId);
-                dynamic categoryObj = JsonConvert.DeserializeObject(categoryRes);
-
-                if (categoryObj?.data == null)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Category not found");
-
-                string categoryName = (string)categoryObj.data.name ?? "Section";
-
-                // Step 3 — flatten article IDs
-                List<string> articleIds = ExtractArticleIds(categoryObj.data);
-                if (!articleIds.Any())
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found");
-
-                // Step 4 — fetch articles in parallel
-                var articleTasks = articleIds.Select(async articleId =>
+                val2.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                val2.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
                 {
-                    try
-                    {
-                        var detailRes = await GetArticleDetail(articleId);
-                        dynamic detailObj = JsonConvert.DeserializeObject(detailRes);
-                        string title = (string)detailObj?.data?.title ?? "";
-                        string content = (string)detailObj?.data?.html_content ?? "";
-                        if (!string.IsNullOrWhiteSpace(content))
-                            return $"<h1>{System.Net.WebUtility.HtmlEncode(title)}</h1>{content}<hr style='page-break-after:always;'/>";
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[Article] Skipping {articleId}: {ex.Message}");
-                    }
-                    return null;
-                }).ToList();
-
-                var results = await Task.WhenAll(articleTasks);
-                var fullHtml = new StringBuilder();
-                foreach (var r in results)
-                {
-                    if (r != null) fullHtml.Append(r);
-                }
-
-                if (fullHtml.Length == 0)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No content retrieved");
-
-                // Step 5 — generate PDF
-                byte[] pdfBytes = GenerateBusinessPdf(fullHtml.ToString(), 0);
-
-                // ✅ Save to cache so next request skips all the above
-                SavePdfToCache(cacheFilePath, pdfBytes);
-
-                return BuildPdfResponse(pdfBytes, categoryName);
+                    FileName = text3 + ".pdf"
+                };
+                return val2;
             }
-            catch (HttpRequestException httpEx)
+            catch (HttpRequestException ex)
             {
-                return Request.CreateErrorResponse(HttpStatusCode.BadGateway,
-                    $"Document360 API unreachable: {httpEx.Message}");
+                return Request.CreateErrorResponse(HttpStatusCode.BadGateway, "Document360 API unreachable: " + ex.Message);
             }
-            catch (Exception ex)
+            catch (Exception ex2)
             {
-                return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.Message);
+                return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex2.Message);
             }
         }
 
-        // ─── Optional: bust the cache for a specific URL ─────────────────────────────
+        // Change #8: ClearCache endpoint
         [HttpDelete]
         [Route("ClearCache")]
         public HttpResponseMessage ClearCache([FromBody] UrlRequestModel req)
@@ -1057,24 +426,15 @@ namespace PickupAPi.Controllers
             if (string.IsNullOrWhiteSpace(req?.Url))
                 return Request.CreateResponse(HttpStatusCode.BadRequest, "URL missing");
 
-            string filePath = GetCacheFilePath(req.Url);
-
-            if (!File.Exists(filePath))
+            string cacheFilePath = GetCacheFilePath(req.Url);
+            if (!File.Exists(cacheFilePath))
                 return Request.CreateResponse(HttpStatusCode.NotFound, "No cached PDF for this URL");
 
-            File.Delete(filePath);
+            File.Delete(cacheFilePath);
             return Request.CreateResponse(HttpStatusCode.OK, "Cache cleared");
         }
 
-        // ─── Optional: force-regenerate regardless of cache ──────────────────────────
-        // Just pass forceRefresh: true in the request body
-        public class UrlRequestModel
-        {
-            public string Url { get; set; }
-            public bool? ForceRefresh { get; set; } = false;  // ← add this
-        }
-
-
+        // Change #9: Keep GenerateFullSectionPdf endpoint
         [HttpPost]
         [Route("GenerateFullSectionPdf")]
         public async Task<HttpResponseMessage> GenerateFullSectionPdf([FromBody] ArticleRequest req)
@@ -1082,421 +442,764 @@ namespace PickupAPi.Controllers
             if (string.IsNullOrEmpty(req?.ArticleId))
                 return Request.CreateResponse(HttpStatusCode.BadRequest, "Invalid ArticleId");
 
+            HttpClient client = new HttpClient();
             try
             {
-                var articleRes = await _sharedHttpClient.GetStringAsync(
-                    $"https://kms.cloud.global/api/document/get-article-detail?articleId={req.ArticleId}&lang=en&version-slug=trustedwifi");
+                dynamic val = JsonConvert.DeserializeObject(await client.GetStringAsync("https://kms.cloud.global/api/document/get-article-detail?articleId=" + req.ArticleId + "&lang=en&version-slug=trustedwifi"));
+                string text = val.data.categoryId;
+                dynamic val2 = JsonConvert.DeserializeObject(await client.GetStringAsync("https://kms.cloud.global/api/document/get-category-articles?categoryId=" + text + "&lang=en&version-slug=trustedwifi"));
+                dynamic val3 = val2.data.articles;
+                List<object> list = ((IEnumerable<object>)val3).OrderBy((dynamic a) => (int)a.order).ToList();
+                List<string> allHtml = new List<string>();
 
-                dynamic articleObj = JsonConvert.DeserializeObject(articleRes);
-                string categoryId = articleObj.data.categoryId;
-
-                var categoryRes = await _sharedHttpClient.GetStringAsync(
-                    $"https://kms.cloud.global/api/document/get-category-articles?categoryId={categoryId}&lang=en&version-slug=trustedwifi");
-
-                dynamic categoryObj = JsonConvert.DeserializeObject(categoryRes);
-
-                var articles = categoryObj.data.articles;
-
-                var sortedArticles = ((IEnumerable<dynamic>)articles)
-                    .OrderBy(a => (int)a.order)
-                    .ToList();
-
-                var allHtml = new List<string>();
-
-                foreach (var art in sortedArticles)
+                foreach (dynamic item in list)
                 {
-                    var res = await _sharedHttpClient.GetStringAsync(
-                        $"https://kms.cloud.global/api/document/get-article-detail?articleId={art.id}&lang=en&version-slug=trustedwifi");
-
-                    dynamic obj = JsonConvert.DeserializeObject(res);
-
-                    string title = obj.data.title;
-                    string html = obj.data.content;
-
-                    if (!string.IsNullOrEmpty(html))
+                    dynamic val4 = JsonConvert.DeserializeObject(await client.GetStringAsync($"https://kms.cloud.global/api/document/get-article-detail?articleId={(object)item.id}&lang=en&version-slug=trustedwifi"));
+                    string text2 = val4.data.title;
+                    string text3 = val4.data.content;
+                    if (!string.IsNullOrEmpty(text3))
                     {
-                        html = $"<h1>{title}</h1>" + html;
-                        allHtml.Add(html);
+                        text3 = "<h1>" + text2 + "</h1>" + text3;
+                        allHtml.Add(text3);
                     }
                 }
 
-                StringBuilder finalHtml = new StringBuilder();
-
-                foreach (var html in allHtml)
+                StringBuilder stringBuilder = new StringBuilder();
+                foreach (string item2 in allHtml)
                 {
-                    finalHtml.Append("<div style='page-break-before:always'></div>");
-                    finalHtml.Append(html);
+                    stringBuilder.Append("<div style='page-break-before:always'></div>");
+                    stringBuilder.Append(item2);
                 }
 
-                byte[] pdfBytes = GenerateBusinessPdf(finalHtml.ToString(), 0);
-
-                var response = new HttpResponseMessage(HttpStatusCode.OK)
+                byte[] array = GenerateBusinessPdf(stringBuilder.ToString());
+                HttpResponseMessage val5 = new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new ByteArrayContent(pdfBytes)
+                    Content = (HttpContent)new ByteArrayContent(array)
                 };
-
-                response.Content.Headers.ContentType =
-                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-
-                response.Content.Headers.ContentDisposition =
-                    new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                    {
-                        FileName = "FullSection.pdf"
-                    };
-
-                return response;
+                val5.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+                val5.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
+                {
+                    FileName = "FullSection.pdf"
+                };
+                return val5;
             }
             catch (Exception ex)
             {
                 return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex.Message);
             }
+            finally
+            {
+                ((IDisposable)client)?.Dispose();
+            }
         }
 
-        private List<int> headingNumbers = new List<int>();
+        // =========================================================================
+        // PDF CACHE HELPERS
+        // =========================================================================
 
-        private void DefineStyles(Document doc)
+        private string GetCacheFilePath(string articleUrl)
         {
-            // Normal text style
-            Style normal = doc.Styles["Normal"];
-            normal.Font.Name = "Arial";
-            normal.Font.Size = 10;
-
-            // Heading styles
-            Style heading1 = doc.Styles["Heading1"];
-            heading1.Font.Name = "Arial";
-            heading1.Font.Size = 24;
-            heading1.Font.Bold = true;
-            heading1.Font.Color = new Color(28, 74, 113); // Nomadix blue
-            heading1.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(2);
-            heading1.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(2);
-
-            Style heading2 = doc.Styles["Heading2"];
-            heading2.Font.Name = "Arial";
-            heading2.Font.Size = 18;
-            heading2.Font.Bold = true;
-            heading2.Font.Color = Colors.Black;
-            heading2.ParagraphFormat.SpaceBefore = Unit.FromPoint(9); // IS-003: 8pt before
-            heading2.ParagraphFormat.SpaceAfter = Unit.FromPoint(7);  // IS-003: 6pt after
-
-            Style heading3 = doc.Styles["Heading3"];
-            heading3.Font.Name = "Arial";
-            heading3.Font.Size = 16;
-            heading3.Font.Bold = false;
-            heading3.Font.Color = Colors.Black;
-            heading3.ParagraphFormat.SpaceBefore = Unit.FromPoint(14); // 12pt padding before subheadings
-            heading3.ParagraphFormat.SpaceAfter = Unit.FromPoint(8);   // 6pt after for clear separation
-
-            // Create custom styles for notes and warnings
-            Style noteStyle = doc.Styles.AddStyle("NoteBox", "Normal");
-            noteStyle.ParagraphFormat.Borders.Width = 0.5;
-            noteStyle.ParagraphFormat.Borders.Color = new Color(0, 106, 138); // Nomadix teal color
-            noteStyle.ParagraphFormat.Borders.Distance = 3;
-            noteStyle.ParagraphFormat.Shading.Color = new Color(28, 74, 113); // Nomadix blue background
-            noteStyle.ParagraphFormat.LeftIndent = 9;
-            noteStyle.ParagraphFormat.RightIndent = 9;
-            noteStyle.Font.Color = Colors.White;
-            noteStyle.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(0.6);
-            noteStyle.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(0.4);
-
-            Style warningStyle = doc.Styles.AddStyle("WarningBox", "Normal");
-            warningStyle.ParagraphFormat.Borders.Width = 0.5;
-            warningStyle.ParagraphFormat.Borders.Color = new Color(127, 100, 22); // Warning border color
-            warningStyle.ParagraphFormat.Borders.Distance = 3;
-            warningStyle.ParagraphFormat.Shading.Color = new Color(253, 242, 206); // Warning background color
-            warningStyle.ParagraphFormat.LeftIndent = 9;
-            warningStyle.ParagraphFormat.RightIndent = 9;
-            warningStyle.Font.Color = new Color(127, 100, 22); // Warning text color
-            warningStyle.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(0.6);
-            warningStyle.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(0.4);
-
-            // Table styles - standardized formatting
-            Style tableStyle = doc.Styles.AddStyle("Table", "Normal");
-            tableStyle.Font.Name = "Arial";
-            tableStyle.Font.Size = 10; // Increased from 9pt to 10pt for better readability
-            tableStyle.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(1.0); // Space before table
-            tableStyle.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(0.8);  // Space after table
-            tableStyle.ParagraphFormat.LineSpacing = Unit.FromPoint(12); // Reduced line spacing to prevent crowding
-
-            Style tableHeader = doc.Styles.AddStyle("TableHeader", "Table");
-            tableHeader.Font.Bold = true;
-            tableHeader.Font.Name = "Arial";
-            tableHeader.Font.Size = 10; // Consistent font size
-            tableHeader.ParagraphFormat.Alignment = ParagraphAlignment.Center;
-            tableHeader.ParagraphFormat.Shading.Color = new Color(191, 191, 191); // Gray background for headers
-
-
+            using (SHA256 sHA = SHA256.Create())
+            {
+                byte[] array = sHA.ComputeHash(Encoding.UTF8.GetBytes(articleUrl.Trim().ToLowerInvariant()));
+                string text = BitConverter.ToString(array).Replace("-", "").ToLowerInvariant();
+                return Path.Combine(PDF_CACHE_DIR, text + ".pdf");
+            }
         }
+
+        private byte[] TryGetCachedPdf(string filePath)
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    Console.WriteLine("[PDF Cache] HIT -> " + filePath);
+                    return File.ReadAllBytes(filePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[PDF Cache] Read error: " + ex.Message);
+            }
+            return null;
+        }
+
+        private void SavePdfToCache(string filePath, byte[] pdfBytes)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+                File.WriteAllBytes(filePath, pdfBytes);
+                Console.WriteLine("[PDF Cache] SAVED -> " + filePath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[PDF Cache] Write error: " + ex.Message);
+            }
+        }
+
+        private HttpResponseMessage BuildPdfResponse(byte[] pdfBytes, string categoryName)
+        {
+            string text = string.Concat((categoryName ?? "Section").Split(Path.GetInvalidFileNameChars()));
+            HttpResponseMessage val = new HttpResponseMessage(HttpStatusCode.OK);
+            val.Content = new ByteArrayContent(pdfBytes);
+            val.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+            val.Content.Headers.ContentLength = pdfBytes.Length;
+            val.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("inline")
+            {
+                FileName = text + ".pdf"
+            };
+            val.Headers.Add("X-PDF-Size", pdfBytes.Length.ToString());
+            return val;
+        }
+
+        // =========================================================================
+        // IMAGE CACHE (Change #5)
+        // =========================================================================
+
+        private string GetCachedImagePath(string imageUrl)
+        {
+            try
+            {
+                using (SHA256 sha = SHA256.Create())
+                {
+                    byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(imageUrl.Trim().ToLowerInvariant()));
+                    string hex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                    string ext = Path.GetExtension(new Uri(imageUrl).AbsolutePath);
+                    if (string.IsNullOrEmpty(ext)) ext = ".png";
+                    return Path.Combine(IMAGE_CACHE_DIR, hex + ext);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private string DownloadImageCached(string imageUrl)
+        {
+            string cachedPath = GetCachedImagePath(imageUrl);
+            if (cachedPath != null && File.Exists(cachedPath))
+                return cachedPath;
+
+            try
+            {
+                Directory.CreateDirectory(IMAGE_CACHE_DIR);
+                using (WebClient webClient = new WebClient())
+                {
+                    webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+                    string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".tmp");
+                    webClient.DownloadFile(imageUrl, tempPath);
+
+                    if (cachedPath != null)
+                    {
+                        File.Move(tempPath, cachedPath);
+                        return cachedPath;
+                    }
+                    return tempPath;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[ImageCache] Download error: " + ex.Message);
+                return null;
+            }
+        }
+
+        // =========================================================================
+        // PDF GENERATION CORE
+        // =========================================================================
+
+        public byte[] GenerateBusinessPdf(string htmlContent, int coverPageType = 0)
+        {
+            Debug.WriteLine("[PDF] === GenerateBusinessPdf START ===");
+            Debug.WriteLine("[PDF] HTML length: " + (htmlContent?.Length ?? 0));
+            Debug.WriteLine("[PDF] HTML preview: " + (htmlContent?.Substring(0, Math.Min(200, htmlContent?.Length ?? 0)) ?? "NULL"));
+            Debug.WriteLine("[PDF] FontResolver: " + (PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().Name ?? "NULL"));
+            Debug.WriteLine("[PDF] Is64Bit: " + Environment.Is64BitProcess);
+
+            MigraDoc.DocumentObjectModel.Document document = new MigraDoc.DocumentObjectModel.Document();
+            HtmlDocument htmlDocument = new HtmlDocument();
+
+            if (!string.IsNullOrEmpty(htmlContent))
+                htmlDocument.LoadHtml(htmlContent);
+
+            Debug.WriteLine("[PDF] HTML nodes: " + htmlDocument.DocumentNode.ChildNodes.Count);
+
+            DefineStyles(document);
+
+            if (coverPageType == 1)
+                AddCustomCoverPage(document);
+            else
+                AddCoverPage(document);
+
+            Debug.WriteLine("[PDF] Cover page added");
+
+            headings = new List<(string, string, string)>();
+            Section indexSection = CreateAndInsertTocSection(document);
+
+            Section section = document.AddSection();
+            AddHeader(section);
+            AddFooter(section);
+
+            PageSetup pageSetup = section.PageSetup;
+            pageSetup.PageWidth = Unit.FromCentimeter(21.0);
+            pageSetup.PageHeight = Unit.FromCentimeter(29.7);
+            pageSetup.TopMargin = Unit.FromCentimeter(2.5);
+            pageSetup.BottomMargin = Unit.FromCentimeter(2.5);
+            pageSetup.LeftMargin = Unit.FromCentimeter(2.5);
+            pageSetup.RightMargin = Unit.FromCentimeter(2.5);
+            pageSetup.HeaderDistance = Unit.FromCentimeter(0.8);
+            pageSetup.FooterDistance = Unit.FromCentimeter(0.8);
+
+            ProcessHtmlContent(htmlContent, section);
+
+            Debug.WriteLine("[PDF] Headings found: " + headings.Count);
+            Debug.WriteLine("[PDF] Sections: " + document.Sections.Count);
+
+            DocumentRenderer documentRenderer = new DocumentRenderer(document);
+            documentRenderer.PrepareDocument();
+
+            Debug.WriteLine("[PDF] DocumentRenderer prepared. PageCount: " + documentRenderer.FormattedDocument.PageCount);
+
+            PopulateIndexSection(indexSection, headings);
+
+            PdfDocumentRenderer pdfDocumentRenderer = new PdfDocumentRenderer(unicode: true);
+            pdfDocumentRenderer.Document = document;
+            pdfDocumentRenderer.RenderDocument();
+
+            Debug.WriteLine("[PDF] RenderDocument done");
+
+            using (MemoryStream memoryStream = new MemoryStream())
+            {
+                pdfDocumentRenderer.PdfDocument.Save(memoryStream, closeStream: false);
+                byte[] result = memoryStream.ToArray();
+                Debug.WriteLine("[PDF] PDF bytes: " + result.Length);
+                Debug.WriteLine("[PDF] === GenerateBusinessPdf END ===");
+                return result;
+            }
+        }
+
+        // =========================================================================
+        // COVER PAGES
+        // =========================================================================
+
+        private void AddCoverPage(MigraDoc.DocumentObjectModel.Document doc)
+        {
+            Section section = doc.AddSection();
+            section.PageSetup = new PageSetup
+            {
+                PageWidth = Unit.FromCentimeter(21.0),
+                PageHeight = Unit.FromCentimeter(29.7),
+                TopMargin = Unit.FromCentimeter(0.0),
+                BottomMargin = Unit.FromCentimeter(0.0),
+                LeftMargin = Unit.FromCentimeter(0.0),
+                RightMargin = Unit.FromCentimeter(0.0)
+            };
+
+            Image image = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/header-logo.png"));
+            image.Width = section.PageSetup.PageWidth;
+            image.Height = Unit.FromCentimeter(18.0);
+            image.RelativeVertical = RelativeVertical.Page;
+            image.RelativeHorizontal = RelativeHorizontal.Page;
+            image.Top = Unit.FromCentimeter(0.0);
+            image.Left = Unit.FromCentimeter(0.0);
+            image.WrapFormat.Style = WrapStyle.Through;
+
+            Image image2 = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/middle.png"));
+            image2.Width = section.PageSetup.PageWidth;
+            image2.Height = Unit.FromCentimeter(7.0);
+            image2.RelativeVertical = RelativeVertical.Page;
+            image2.RelativeHorizontal = RelativeHorizontal.Page;
+            image2.Top = Unit.FromCentimeter(19.0);
+            image2.Left = Unit.FromCentimeter(0.0);
+            image2.WrapFormat.Style = WrapStyle.Through;
+
+            Table table = section.Footers.Primary.AddTable();
+            table.Borders.Width = 0;
+            table.AddColumn(Unit.FromCentimeter(16.0));
+            table.AddColumn(Unit.FromCentimeter(5.0));
+            Row row = table.AddRow();
+            row.Shading.Color = new MigraDoc.DocumentObjectModel.Color(122, 181, 92);
+            Paragraph paragraph = row.Cells[0].AddParagraph();
+            paragraph.AddFormattedText("® NOMADIX", TextFormat.Bold);
+            paragraph.Format.Font.Size = 11;
+            paragraph.Format.Font.Color = Colors.White;
+            paragraph.Format.Alignment = ParagraphAlignment.Left;
+            paragraph.Format.LeftIndent = Unit.FromCentimeter(0.5);
+            row.Cells[0].VerticalAlignment = VerticalAlignment.Center;
+            row.Height = Unit.FromCentimeter(1.4);
+        }
+
+        private void AddCustomCoverPage(MigraDoc.DocumentObjectModel.Document doc)
+        {
+            Section section = doc.AddSection();
+            section.PageSetup = new PageSetup
+            {
+                PageWidth = Unit.FromCentimeter(21.0),
+                PageHeight = Unit.FromCentimeter(29.7),
+                TopMargin = Unit.FromCentimeter(0.0),
+                BottomMargin = Unit.FromCentimeter(0.0),
+                LeftMargin = Unit.FromCentimeter(0.0),
+                RightMargin = Unit.FromCentimeter(0.0)
+            };
+
+            Image image = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/pdfbackground.jpg"));
+            image.Width = section.PageSetup.PageWidth;
+            image.Height = section.PageSetup.PageHeight;
+            image.RelativeVertical = RelativeVertical.Page;
+            image.RelativeHorizontal = RelativeHorizontal.Page;
+            image.Top = Unit.FromCentimeter(0.0);
+            image.Left = Unit.FromCentimeter(0.0);
+            image.WrapFormat.Style = WrapStyle.Through;
+        }
+
+        // =========================================================================
+        // HEADER / FOOTER
+        // =========================================================================
+
+        private void AddHeader(Section section)
+        {
+            HeaderFooter primary = section.Headers.Primary;
+            Table table = primary.AddTable();
+            table.Borders.Width = 0;
+            table.AddColumn(Unit.FromCentimeter(10.0));
+            table.AddColumn(Unit.FromCentimeter(6.0));
+            Row row = table.AddRow();
+            Paragraph paragraph = row.Cells[0].AddParagraph("Administration Guide");
+            paragraph.Format.Font.Size = 12;
+            paragraph.Format.Font.Bold = true;
+            paragraph.Format.Alignment = ParagraphAlignment.Left;
+            row.Cells[0].VerticalAlignment = VerticalAlignment.Center;
+
+            Paragraph paragraph2 = row.Cells[1].AddParagraph("Nomadix");
+            paragraph2.Format.Font.Size = 14;
+            paragraph2.Format.Font.Bold = true;
+            paragraph2.Format.Alignment = ParagraphAlignment.Right;
+            row.Cells[1].VerticalAlignment = VerticalAlignment.Center;
+
+            Paragraph paragraph3 = primary.AddParagraph();
+            paragraph3.Format.Borders.Top.Width = 0.2;
+            paragraph3.Format.Borders.Top.Color = Colors.Gray;
+            paragraph3.Format.SpaceAfter = Unit.FromCentimeter(0.2);
+        }
+
+        private void AddFooter(Section section)
+        {
+            HeaderFooter primary = section.Footers.Primary;
+            Paragraph paragraph = primary.AddParagraph();
+            paragraph.Format.SpaceBefore = Unit.FromPoint(14.0);
+
+            Paragraph paragraph2 = primary.AddParagraph();
+            paragraph2.Format.Borders.Top.Width = 0.05;
+            paragraph2.Format.Borders.Top.Color = Colors.LightGray;
+
+            Table table = primary.AddTable();
+            table.Borders.Width = 0;
+            table.AddColumn(Unit.FromCentimeter(4.0));
+            table.AddColumn(Unit.FromCentimeter(10.0));
+            table.AddColumn(Unit.FromCentimeter(2.0));
+            Row row = table.AddRow();
+            row.Height = Unit.FromCentimeter(0.8);
+
+            string text = DateTime.Now.ToString("MMMM yyyy");
+            Paragraph paragraph3 = row.Cells[0].AddParagraph();
+            paragraph3.AddText(text);
+            paragraph3.Format.Font.Size = 8;
+            paragraph3.Format.Font.Color = Colors.Gray;
+            paragraph3.Format.Font.Bold = false;
+            paragraph3.Format.Alignment = ParagraphAlignment.Left;
+            row.Cells[0].VerticalAlignment = VerticalAlignment.Center;
+
+            Paragraph paragraph4 = row.Cells[1].AddParagraph();
+            paragraph4.AddText("Information subject to change without notice");
+            paragraph4.Format.Font.Size = 8;
+            paragraph4.Format.Font.Color = Colors.Gray;
+            paragraph4.Format.Font.Bold = false;
+            paragraph4.Format.LeftIndent = Unit.FromCentimeter(0.01);
+            paragraph4.Format.Alignment = ParagraphAlignment.Center;
+            row.Cells[1].VerticalAlignment = VerticalAlignment.Center;
+
+            Paragraph paragraph5 = row.Cells[2].AddParagraph();
+            paragraph5.AddPageField();
+            paragraph5.Format.Font.Size = 8;
+            paragraph5.Format.Font.Color = Colors.Gray;
+            paragraph5.Format.Font.Bold = false;
+            paragraph5.Format.Alignment = ParagraphAlignment.Right;
+            row.Cells[2].VerticalAlignment = VerticalAlignment.Center;
+        }
+
+        // =========================================================================
+        // TOC (Index Section)
+        // =========================================================================
+
+        private Section CreateAndInsertTocSection(MigraDoc.DocumentObjectModel.Document doc)
+        {
+            Section section = new Section();
+            section.PageSetup = new PageSetup
+            {
+                PageWidth = Unit.FromCentimeter(21.0),
+                PageHeight = Unit.FromCentimeter(29.7),
+                TopMargin = Unit.FromCentimeter(2.5),
+                BottomMargin = Unit.FromCentimeter(2.5),
+                LeftMargin = Unit.FromCentimeter(2.5),
+                RightMargin = Unit.FromCentimeter(2.5)
+            };
+            doc.Sections.InsertObject(1, section);
+            return section;
+        }
+
+        private void PopulateIndexSection(Section indexSection, List<(string Title, string Bookmark, string Level)> headings)
+        {
+            if (indexSection == null || headings == null || !headings.Any())
+                return;
+
+            indexSection.PageSetup = new PageSetup
+            {
+                PageWidth = Unit.FromCentimeter(21.0),
+                PageHeight = Unit.FromCentimeter(29.7),
+                TopMargin = Unit.FromCentimeter(2.5),
+                BottomMargin = Unit.FromCentimeter(2.5),
+                LeftMargin = Unit.FromCentimeter(2.5),
+                RightMargin = Unit.FromCentimeter(2.5)
+            };
+
+            Paragraph paragraph = indexSection.AddParagraph("Table of Contents");
+            paragraph.Format.Font.Size = 16;
+            paragraph.Format.Font.Bold = true;
+            paragraph.Format.Font.Color = Color.FromRgb(81, 162, 198);
+            paragraph.Format.Alignment = ParagraphAlignment.Center;
+            paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.5);
+            paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.5);
+
+            Paragraph paragraph2 = indexSection.AddParagraph();
+            paragraph2.Format.Borders.Bottom.Width = 1;
+            paragraph2.Format.Borders.Bottom.Color = Color.FromRgb(81, 162, 198);
+            paragraph2.Format.SpaceAfter = Unit.FromCentimeter(1.0);
+
+            Table table = indexSection.AddTable();
+            table.Borders.Visible = false;
+            table.AddColumn(Unit.FromCentimeter(1.5));
+            table.AddColumn(Unit.FromCentimeter(12.0));
+            table.AddColumn(Unit.FromCentimeter(2.5));
+
+            Row row = table.AddRow();
+            row.HeadingFormat = true;
+            row.Format.Font.Bold = true;
+            row.Format.Font.Size = 12;
+            row.Shading.Color = Color.FromRgb(240, 240, 240);
+            row.Format.SpaceAfter = Unit.FromCentimeter(0.3);
+            row.Format.SpaceBefore = Unit.FromCentimeter(0.5);
+            row.Height = Unit.FromCentimeter(0.3);
+            row.HeightRule = RowHeightRule.AtLeast;
+
+            for (int i = 0; i < row.Cells.Count; i++)
+            {
+                Cell cell = row.Cells[i];
+                cell.Format.LeftIndent = Unit.FromCentimeter(0.3);
+                cell.Format.RightIndent = Unit.FromCentimeter(0.3);
+                cell.Format.SpaceBefore = Unit.FromPoint(0.5);
+                cell.Format.SpaceAfter = Unit.FromPoint(0.3);
+                cell.VerticalAlignment = VerticalAlignment.Center;
+                cell.Format.Alignment = ParagraphAlignment.Left;
+            }
+
+            row.Cells[0].AddParagraph("#");
+            row.Cells[1].AddParagraph("Section");
+            row.Cells[2].AddParagraph("Page");
+            row.Cells[2].Format.Alignment = ParagraphAlignment.Left;
+
+            int num = 1;
+            int num2 = 1;
+
+            Row row2 = table.AddRow();
+            row2.Height = Unit.FromCentimeter(0.4);
+            row2.HeightRule = RowHeightRule.AtLeast;
+            for (int j = 0; j < row2.Cells.Count; j++)
+            {
+                row2.Cells[j].AddParagraph(string.Empty);
+                row2.Cells[j].Borders.Visible = false;
+            }
+
+            foreach (var heading in headings)
+            {
+                Row row3 = table.AddRow();
+                row3.Format.Font.Size = 10;
+
+                if (heading.Level == "H2")
+                {
+                    num2 = 1;
+                    Paragraph paragraph3 = row3.Cells[0].AddParagraph(num.ToString());
+                    paragraph3.Format.Font.Bold = true;
+                    paragraph3.Format.Font.Color = Color.FromRgb(81, 162, 198);
+
+                    Paragraph paragraph4 = row3.Cells[1].AddParagraph();
+                    Hyperlink hyperlink = paragraph4.AddHyperlink(heading.Bookmark, HyperlinkType.Local);
+                    hyperlink.AddText(heading.Title);
+                    hyperlink.Font.Color = Color.FromRgb(51, 51, 51);
+                    hyperlink.Font.Underline = Underline.Single;
+                    hyperlink.Font.Bold = true;
+                    num++;
+                }
+                else if (heading.Level == "H3")
+                {
+                    Paragraph paragraph5 = row3.Cells[0].AddParagraph($"{num - 1}.{num2}");
+                    paragraph5.Format.Font.Color = Color.FromRgb(120, 120, 120);
+
+                    Paragraph paragraph6 = row3.Cells[1].AddParagraph();
+                    paragraph6.Format.LeftIndent = Unit.FromCentimeter(0.8);
+                    Hyperlink hyperlink2 = paragraph6.AddHyperlink(heading.Bookmark, HyperlinkType.Local);
+                    hyperlink2.AddText(heading.Title);
+                    hyperlink2.Font.Color = Color.FromRgb(80, 80, 80);
+                    hyperlink2.Font.Underline = Underline.Single;
+                    num2++;
+                }
+
+                Paragraph paragraph7 = row3.Cells[2].AddParagraph();
+                Hyperlink hyperlink3 = paragraph7.AddHyperlink(heading.Bookmark, HyperlinkType.Local);
+                hyperlink3.AddPageRefField(heading.Bookmark);
+                hyperlink3.Font.Color = Color.FromRgb(81, 162, 198);
+                hyperlink3.Font.Underline = Underline.Single;
+                paragraph7.Format.Alignment = ParagraphAlignment.Center;
+
+                row3.Format.SpaceBefore = Unit.FromPoint(0.5);
+                row3.Format.SpaceAfter = Unit.FromPoint(6.0);
+            }
+        }
+
+        // =========================================================================
+        // STYLES (Change #1: Montserrat -> Arial)
+        // =========================================================================
+
+        private void DefineStyles(MigraDoc.DocumentObjectModel.Document doc)
+        {
+            Style style = doc.Styles["Normal"];
+            style.Font.Name = "Arial";
+            style.Font.Size = 10;
+
+            Style style2 = doc.Styles["Heading1"];
+            style2.Font.Name = "Arial";
+            style2.Font.Size = 24;
+            style2.Font.Bold = true;
+            style2.Font.Color = new MigraDoc.DocumentObjectModel.Color(28, 74, 113);
+            style2.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(2.0);
+            style2.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(2.0);
+
+            Style style3 = doc.Styles["Heading2"];
+            style3.Font.Name = "Arial";
+            style3.Font.Size = 18;
+            style3.Font.Bold = true;
+            style3.Font.Color = Colors.Black;
+            style3.ParagraphFormat.SpaceBefore = Unit.FromPoint(9.0);
+            style3.ParagraphFormat.SpaceAfter = Unit.FromPoint(7.0);
+
+            Style style4 = doc.Styles["Heading3"];
+            style4.Font.Name = "Arial";
+            style4.Font.Size = 16;
+            style4.Font.Bold = false;
+            style4.Font.Color = Colors.Black;
+            style4.ParagraphFormat.SpaceBefore = Unit.FromPoint(14.0);
+            style4.ParagraphFormat.SpaceAfter = Unit.FromPoint(8.0);
+
+            Style style5 = doc.Styles.AddStyle("NoteBox", "Normal");
+            style5.ParagraphFormat.Borders.Width = 0.5;
+            style5.ParagraphFormat.Borders.Color = new MigraDoc.DocumentObjectModel.Color(0, 106, 138);
+            style5.ParagraphFormat.Borders.Distance = 3;
+            style5.ParagraphFormat.Shading.Color = new MigraDoc.DocumentObjectModel.Color(28, 74, 113);
+            style5.ParagraphFormat.LeftIndent = 9;
+            style5.ParagraphFormat.RightIndent = 9;
+            style5.Font.Color = Colors.White;
+            style5.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(0.6);
+            style5.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(0.4);
+
+            Style style6 = doc.Styles.AddStyle("WarningBox", "Normal");
+            style6.ParagraphFormat.Borders.Width = 0.5;
+            style6.ParagraphFormat.Borders.Color = new MigraDoc.DocumentObjectModel.Color(127, 100, 22);
+            style6.ParagraphFormat.Borders.Distance = 3;
+            style6.ParagraphFormat.Shading.Color = new MigraDoc.DocumentObjectModel.Color(253, 242, 206);
+            style6.ParagraphFormat.LeftIndent = 9;
+            style6.ParagraphFormat.RightIndent = 9;
+            style6.Font.Color = new MigraDoc.DocumentObjectModel.Color(127, 100, 22);
+            style6.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(0.6);
+            style6.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(0.4);
+
+            Style style7 = doc.Styles.AddStyle("Table", "Normal");
+            style7.Font.Name = "Arial";
+            style7.Font.Size = 10;
+            style7.ParagraphFormat.SpaceBefore = Unit.FromCentimeter(1.0);
+            style7.ParagraphFormat.SpaceAfter = Unit.FromCentimeter(0.8);
+            style7.ParagraphFormat.LineSpacing = Unit.FromPoint(12.0);
+
+            Style style8 = doc.Styles.AddStyle("TableHeader", "Table");
+            style8.Font.Bold = true;
+            style8.Font.Name = "Arial";
+            style8.Font.Size = 10;
+            style8.ParagraphFormat.Alignment = ParagraphAlignment.Center;
+            style8.ParagraphFormat.Shading.Color = new MigraDoc.DocumentObjectModel.Color(191, 191, 191);
+        }
+
+        // =========================================================================
+        // HTML PROCESSING
+        // =========================================================================
 
         private void ProcessHtmlContent(string htmlContent, Section section)
         {
-            HtmlDocument htmlDoc = new HtmlDocument();
-            htmlDoc.LoadHtml(htmlContent);
-
-            // Process the root node (article)
-            var articleNode = htmlDoc.DocumentNode.SelectSingleNode("//article");
-            if (articleNode != null)
-            {
-                ProcessHtmlNode(articleNode, section);
-            }
+            HtmlDocument htmlDocument = new HtmlDocument();
+            htmlDocument.LoadHtml(htmlContent);
+            HtmlNode htmlNode = htmlDocument.DocumentNode.SelectSingleNode("//article");
+            if (htmlNode != null)
+                ProcessHtmlNode(htmlNode, section);
             else
-            {
-                // If no article tag, process the entire document
-                ProcessHtmlNode(htmlDoc.DocumentNode, section);
-            }
+                ProcessHtmlNode(htmlDocument.DocumentNode, section);
         }
 
         private void ProcessHtmlNode(HtmlNode node, Section section)
         {
-
             if (node == null) return;
 
-            foreach (var childNode in node.ChildNodes)
+            foreach (HtmlNode item in node.ChildNodes)
             {
-                // Skip elements with id="download-this-guide⬇"
-                if (childNode.NodeType == HtmlNodeType.Element &&
-                    childNode.GetAttributeValue("id", "") == "download-this-guide⬇")
-                {
+                if (item.NodeType == HtmlNodeType.Element && item.GetAttributeValue("id", "") == "download-this-guide⬇")
                     continue;
-                }
 
-                // Check for headings to add to table of contents
-                //if (childNode.Name.StartsWith("h") && childNode.Name.Length == 2)
-                //{
-                //    int headingLevel;
-                //    if (int.TryParse(childNode.Name.Substring(1), out headingLevel) && headingLevel <= 3)
-                //    {
-                //        if (!childNode.HasChildNodes || (childNode.ChildNodes.Count == 1 && childNode.FirstChild.Name != "p"))
-                //        {
-                //            string headingNumber = GetNumberedHeading(headingLevel);
-                //            string title = $"{headingNumber} {childNode.InnerText.Trim()}";
-
-                //            string bookmarkName = $"heading_{blockquoteIndex.Count + 1}";
-                //            var headingPara = section.AddParagraph();
-                //            headingPara.AddBookmark(bookmarkName);
-
-                //            blockquoteIndex.Add((title, blockquoteIndex.Count + 1));
-
-                //            var para = section.AddParagraph(title);
-                //            para.Style = $"Heading{headingLevel}";
-                //            para.Format.SpaceAfter = Unit.FromPoint(5);
-                //        }
-                //        return;
-                //    }
-                //}
-
-                if (childNode.NodeType == HtmlNodeType.Text)
+                if (item.NodeType == HtmlNodeType.Text)
                 {
-                    if (!string.IsNullOrWhiteSpace(childNode.InnerText))
-                    {
-                        Paragraph para = section.AddParagraph(childNode.InnerText.Trim());
-                    }
+                    if (!string.IsNullOrWhiteSpace(item.InnerText))
+                        section.AddParagraph(item.InnerText.Trim());
                 }
-                else if (childNode.NodeType == HtmlNodeType.Element)
+                else if (item.NodeType == HtmlNodeType.Element)
                 {
-                    switch (childNode.Name.ToLower())
+                    switch (item.Name.ToLower())
                     {
                         case "h1":
-                            AddHeading(section, childNode.InnerText, "Heading1", 24);
+                            AddHeading(section, item.InnerText, "Heading1", 24);
                             break;
                         case "h2":
-                            AddHeading(section, childNode.InnerText, "Heading2", 18);
+                            AddHeading(section, item.InnerText, "Heading2", 18);
                             subsrno++;
                             break;
                         case "h3":
-                            AddHeading(section, childNode.InnerText, "Heading3", 16);
+                            AddHeading(section, item.InnerText, "Heading3", 16);
                             subsrno = 1;
                             mainsrno++;
                             break;
                         case "h4":
-                            AddHeading(section, childNode.InnerText, "Heading4", 14);
+                            AddHeading(section, item.InnerText, "Heading4", 14);
                             subsrno = 1;
                             mainsrno++;
                             break;
                         case "p":
-                            AddParagraph(section, childNode);
+                            AddParagraph(section, item);
                             break;
                         case "blockquote":
-                            //AddBlockquote(section, childNode);
-                            string type = "";
-                            // Pseudocode:
-                            // - The current condition uses IndexOf("Notes:") > 0, which will not match if "Notes:" is at the start (index 0).
-                            // - To match "Notes:" anywhere (including at the start), use IndexOf("Notes:") >= 0.
-                            // - Alternatively, use StartsWith("Notes:") if you only want to match when it is at the beginning.
-
-                            if (childNode.InnerText.Trim().IndexOf("Notes") >= 0)
-                            {
-                                string str = "";
-                                type = HttpContext.Current.Server.MapPath("~/logo/info_icon.png");
-                                //AddSpace(section);
-                                // Light blue background: #ddf7ff (221, 247, 255)
-                                AddStyledSection(section, "Note", childNode.InnerText.Trim(), MigraDoc.DocumentObjectModel.Color.FromRgb(221, 247, 255), MigraDoc.DocumentObjectModel.Color.FromRgb(28, 74, 113), type);
-                            }
-                            else if (childNode.InnerText.Trim().IndexOf("Warning") >= 0)
-                            {
-                                type = HttpContext.Current.Server.MapPath("~/logo/warning_icon.png");
-                                // Light yellow background: #fdf2ce (253, 242, 206), brown text: #7f6416 (127, 100, 22)
-                                AddStyledSection(section, "Warning", childNode.InnerText.Trim(), MigraDoc.DocumentObjectModel.Color.FromRgb(253, 242, 206), MigraDoc.DocumentObjectModel.Color.FromRgb(127, 100, 22), type);
-                            }
-                            else if (childNode.InnerText.Trim().IndexOf("Tip") >= 0)
-                            {
-                                type = HttpContext.Current.Server.MapPath("~/logo/tip_icon.png");
-                                // Green color matching the image: #8BC34A (139, 195, 74)
-                                AddStyledSection(section, "Tip", childNode.InnerText.Trim(), MigraDoc.DocumentObjectModel.Color.FromRgb(139, 195, 74), Colors.White, type);
-                            }
-                            // Add the blockquote title to the index list
-                            //blockquoteIndex.Add((childNode.InnerText.Trim(), 0)); // Page number will be updated later     
+                            ProcessBlockquote(section, item);
                             break;
                         case "ul":
-                            AddList(section, childNode, false);
+                            AddList(section, item, isOrdered: false);
                             break;
                         case "ol":
-                            AddList(section, childNode, true);
+                            AddList(section, item, isOrdered: true);
                             break;
                         case "table":
-                            AddTable(section, childNode);
+                            AddTable(section, item);
                             break;
                         case "hr":
                             AddHorizontalLine(section);
                             break;
                         case "img":
-                            AddImage(section, childNode);
+                            AddImage(section, item);
                             break;
                         case "div":
                         case "article":
                         case "section":
-                            // Recursively process container elements
-                            ProcessHtmlNode(childNode, section);
+                            ProcessHtmlNode(item, section);
                             break;
                     }
                 }
             }
         }
 
+        private void ProcessBlockquote(Section section, HtmlNode item)
+        {
+            string iconPath = null;
+            string innerTextTrimmed = item.InnerText.Trim();
+
+            if (innerTextTrimmed.IndexOf("Notes") >= 0)
+            {
+                iconPath = HttpContext.Current.Server.MapPath("~/logo/info_icon.png");
+                AddStyledSection(section, "Note", item.InnerText.Trim(),
+                    Color.FromRgb(221, 247, 255), Color.FromRgb(28, 74, 113), iconPath);
+            }
+            else if (innerTextTrimmed.IndexOf("Warning") >= 0)
+            {
+                iconPath = HttpContext.Current.Server.MapPath("~/logo/warning_icon.png");
+                AddStyledSection(section, "Warning", item.InnerText.Trim(),
+                    Color.FromRgb(253, 242, 206), Color.FromRgb(127, 100, 22), iconPath);
+            }
+            else if (innerTextTrimmed.IndexOf("Tip") >= 0)
+            {
+                iconPath = HttpContext.Current.Server.MapPath("~/logo/tip_icon.png");
+                AddStyledSection(section, "Tip", item.InnerText.Trim(),
+                    Color.FromRgb(139, 195, 74), Colors.White, iconPath);
+            }
+        }
+
         private void AddStyledSection(Section section, string title, string content, Color backgroundColor, Color textColor, string iconPath = null)
         {
-            // Add spacing before the styled section
-            //Paragraph spacer = section.AddParagraph();
-            //spacer.Format.SpaceBefore = Unit.FromCentimeter(0.3);
-            //spacer.Format.SpaceAfter = Unit.FromCentimeter(0.1);
-
-            // Create a table to structure the section with rounded appearance
             Table table = section.AddTable();
             table.Borders.Width = 0;
-            //table.Rows.LeftIndent = Unit.FromCentimeter(0.2);
             table.Format.SpaceBefore = Unit.FromCentimeter(0.05);
             table.Format.SpaceAfter = Unit.FromCentimeter(0.05);
-
-            // Add columns: one for the icon, one for the text content
-            //table.AddColumn(Unit.FromCentimeter(1.8)); // Icon column (slightly wider)
-            table.AddColumn(Unit.FromCentimeter(16)); // Text column
-
-            // Add a row to the table
+            table.AddColumn(Unit.FromCentimeter(16.0));
             Row row = table.AddRow();
             row.HeightRule = RowHeightRule.AtLeast;
-            row.Height = Unit.FromCentimeter(1.2); // Minimum height that adjusts to content
-
-            // Set the background color and padding
+            row.Height = Unit.FromCentimeter(1.2);
             row.Shading.Color = backgroundColor;
             row.Format.SpaceBefore = Unit.FromCentimeter(0.06);
             row.Format.SpaceAfter = Unit.FromCentimeter(0.06);
 
-            //// Add the icon cell
-            //Cell iconCell = row.Cells[0];
-            //iconCell.Format.SpaceBefore = Unit.FromCentimeter(0.3);
-            //iconCell.Format.SpaceAfter = Unit.FromCentimeter(0.3);
-            //iconCell.VerticalAlignment = VerticalAlignment.Center;
-            //iconCell.Format.Alignment = ParagraphAlignment.Center;
-
-            // Add left border to the first cell only
-            Color borderColor = Colors.Black; // Default
+            Color textColorToUse = Colors.Black;
             if (title == "Note")
-            {
-                borderColor = MigraDoc.DocumentObjectModel.Color.FromRgb(28, 74, 113); // #1C4A71
-            }
+                textColorToUse = Color.FromRgb(28, 74, 113);
             else if (title == "Warning")
-            {
-                borderColor = MigraDoc.DocumentObjectModel.Color.FromRgb(127, 100, 22); // #7f6416
-            }
+                textColorToUse = Color.FromRgb(127, 100, 22);
 
-            //// Apply left border to the first cell only
-            //iconCell.Borders.Left.Width = Unit.FromPoint(4);
-            //iconCell.Borders.Left.Color = borderColor;
-
-            // Add icon based on title type
             string defaultIconPath = GetDefaultIconPath(title);
-            string finalIconPath = !string.IsNullOrEmpty(iconPath) ? iconPath : defaultIconPath;
+            string resolvedIconPath = !string.IsNullOrEmpty(iconPath) ? iconPath : defaultIconPath;
 
-            //if (!string.IsNullOrEmpty(finalIconPath) && File.Exists(finalIconPath))
-            //{
-            //    try
-            //    {
-            //        Paragraph iconPara = iconCell.AddParagraph();
-            //        iconPara.Format.Alignment = ParagraphAlignment.Center;
-            //        var iconImage = iconPara.AddImage(finalIconPath);
-            //        iconImage.LockAspectRatio = true;
-            //        iconImage.Width = Unit.FromCentimeter(1.0);
-            //        iconImage.Height = Unit.FromCentimeter(1.0);
-            //        iconImage.Left = ShapePosition.Center;
-            //        iconImage.Top = ShapePosition.Center;
-            //    }
-            //    catch (Exception ex)
-            //    {
-            //        Console.WriteLine($"Error adding icon image: {ex.Message}");
-            //        // Add text icon as fallback
-            //        AddTextIcon(iconCell, title, Colors.White);
-            //    }
-            //}
-            //else
-            //{
-            //    // Add text icon as fallback
-            //    AddTextIcon(iconCell, title, Colors.White);
-            //}
+            Cell cell = row.Cells[0];
+            cell.Format.SpaceBefore = Unit.FromCentimeter(0.35);
+            cell.Format.SpaceAfter = Unit.FromCentimeter(0.25);
+            cell.VerticalAlignment = VerticalAlignment.Top;
+            cell.Format.LeftIndent = Unit.FromCentimeter(0.4);
 
-            // Add the content cell
-            Cell contentCell = row.Cells[0];
-            contentCell.Format.SpaceBefore = Unit.FromCentimeter(0.35);
-            contentCell.Format.SpaceAfter = Unit.FromCentimeter(0.25);
-            contentCell.VerticalAlignment = VerticalAlignment.Top;
-            contentCell.Format.LeftIndent = Unit.FromCentimeter(0.4);
+            string content2 = content.Replace("ℹ\ufe0f", "").Replace("⚠\ufe0f", "").Replace("\ud83d\udca1", "");
 
-            // Remove emojis if present
-            string updatedContent = content.Replace("\u2139\uFE0F", "") // ℹ️
-                                           .Replace("\u26A0\uFE0F", "") // ⚠️
-                                           .Replace("\uD83D\uDCA1", ""); // 💡
-
-            // Create title paragraph
-            Paragraph titleParagraph = contentCell.AddParagraph();
+            Paragraph paragraph = cell.AddParagraph();
             string displayTitle = GetDisplayTitle(title);
-            titleParagraph.AddFormattedText(displayTitle, TextFormat.Bold);
-            titleParagraph.Format.Font.Color = textColor;
-            titleParagraph.Format.Font.Size = 11;
-            titleParagraph.Format.SpaceAfter = Unit.FromCentimeter(0.4);
+            paragraph.AddFormattedText(displayTitle, TextFormat.Bold);
+            paragraph.Format.Font.Color = textColor;
+            paragraph.Format.Font.Size = 11;
+            paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.4);
 
-            // Clean the main content
-            string mainContent = CleanContent(updatedContent, title);
-
-            // Create content paragraph
-            Paragraph contentParagraph = contentCell.AddParagraph();
-
-            // Handle content with lists
-            if (mainContent.Contains("<li>") || mainContent.Contains("<ul>"))
+            string cleanedContent = CleanContent(content2, title);
+            Paragraph paragraph2 = cell.AddParagraph();
+            if (cleanedContent.Contains("<li>") || cleanedContent.Contains("<ul>"))
             {
-                ProcessListContent(contentCell, mainContent, textColor);
+                ProcessListContent(cell, cleanedContent, textColor);
             }
             else
             {
-                // Add plain text content
-                contentParagraph.AddText(mainContent);
-                contentParagraph.Format.Font.Color = textColor;
-                contentParagraph.Format.Font.Size = 10;
-                contentParagraph.Format.LineSpacing = Unit.FromCentimeter(0.25);
-                contentParagraph.Format.SpaceBefore = Unit.FromCentimeter(0.25);
+                paragraph2.AddText(cleanedContent);
+                paragraph2.Format.Font.Color = textColor;
+                paragraph2.Format.Font.Size = 10;
+                paragraph2.Format.LineSpacing = Unit.FromCentimeter(0.25);
+                paragraph2.Format.SpaceBefore = Unit.FromCentimeter(0.25);
             }
 
-            // Add spacing after section
-            Paragraph spacer = section.AddParagraph();
-            spacer.Format.SpaceBefore = Unit.FromCentimeter(0.01);
-            spacer.Format.SpaceAfter = Unit.FromCentimeter(0.01);
+            Paragraph paragraph3 = section.AddParagraph();
+            paragraph3.Format.SpaceBefore = Unit.FromCentimeter(0.01);
+            paragraph3.Format.SpaceAfter = Unit.FromCentimeter(0.01);
         }
 
         private string GetDefaultIconPath(string title)
@@ -1515,34 +1218,7 @@ namespace PickupAPi.Controllers
             }
         }
 
-        private void AddTextIcon(Cell iconCell, string title, Color textColor)
-        {
-            Paragraph iconParagraph = iconCell.AddParagraph();
-            string iconText = GetIconText(title);
-            iconParagraph.AddFormattedText(iconText, TextFormat.Bold);
-            iconParagraph.Format.Font.Color = textColor; // Use text color instead of white
-            iconParagraph.Format.Font.Size = 22;
-            iconParagraph.Format.Alignment = ParagraphAlignment.Center;
-            iconParagraph.Format.SpaceBefore = Unit.FromCentimeter(0.1);
-            iconParagraph.Format.SpaceAfter = Unit.FromCentimeter(0.1);
-        }
-
-        private string GetIconText(string title)
-        {
-            switch (title.ToLower())
-            {
-                case "note":
-                case "notes":
-                    return "ℹ";
-                case "warning":
-                    return "⚠";
-                case "tip":
-                    return "💡";
-                default:
-                    return "ℹ";
-            }
-        }
-
+        // Change #3: Fix switch expression -> C# 7.3 compatible switch statement
         private string GetDisplayTitle(string title)
         {
             switch (title.ToLower())
@@ -1560,1061 +1236,456 @@ namespace PickupAPi.Controllers
 
         private string CleanContent(string content, string title)
         {
-            string mainContent = content;
-
-            // Remove title words from content
+            string text = content;
             switch (title.ToLower())
             {
                 case "note":
                 case "notes":
-                    mainContent = mainContent.Replace("Notes:", "").Replace("Note:", "").Replace("Note", "").Trim();
+                    text = text.Replace("Notes:", "").Replace("Note:", "").Replace("Note", "").Trim();
                     break;
                 case "warning":
-                    mainContent = mainContent.Replace("Warning:", "").Replace("Warning", "").Trim();
+                    text = text.Replace("Warning:", "").Replace("Warning", "").Trim();
                     break;
                 case "tip":
-                    mainContent = mainContent.Replace("Tip:", "").Replace("Tip", "").Trim();
+                    text = text.Replace("Tip:", "").Replace("Tip", "").Trim();
                     break;
             }
-
-            return mainContent;
+            return text;
         }
-
-        //private void ProcessListContent(Cell contentCell, string mainContent, Color textColor)
-        //{
-        //    var htmlDoc = new HtmlAgilityPack.HtmlDocument();
-        //    htmlDoc.LoadHtml(mainContent);
-
-        //    // Normal text before lists
-        //    var textNodes = htmlDoc.DocumentNode.ChildNodes
-        //        .Where(n => n.NodeType == HtmlNodeType.Text)
-        //        .Select(n => n.InnerText.Trim())
-        //        .Where(t => !string.IsNullOrWhiteSpace(t));
-
-        //    foreach (var text in textNodes)
-        //    {
-        //        Paragraph textPara = contentCell.AddParagraph();
-        //        textPara.AddText(text);
-        //        textPara.Format.Font.Color = textColor;
-        //        textPara.Format.Font.Size = 10;
-        //        textPara.Format.SpaceAfter = Unit.FromCentimeter(0.1);
-        //    }
-
-        //    // Lists
-        //    var lists = htmlDoc.DocumentNode.SelectNodes("//ul");
-        //    if (lists != null)
-        //    {
-        //        foreach (var list in lists)
-        //        {
-        //            var items = list.SelectNodes("./li");
-        //            if (items != null)
-        //            {
-        //                foreach (var item in items)
-        //                {
-        //                    Paragraph listItemPara = contentCell.AddParagraph();
-        //                    listItemPara.Format.LeftIndent = Unit.FromCentimeter(0.3);
-
-        //                    // Check for paragraphs with images inside list items
-        //                    var paragraphNodes = item.SelectNodes(".//p");
-        //                    if (paragraphNodes != null && paragraphNodes.Count > 0)
-        //                    {
-        //                        // Add bullet point first
-        //                        listItemPara.AddText("• ");
-
-        //                        foreach (var pNode in paragraphNodes)
-        //                        {
-        //                            // Process text content first
-        //                            var _textNodes = pNode.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text);
-        //                            foreach (var textNode in _textNodes)
-        //                            {
-        //                                if (!string.IsNullOrWhiteSpace(textNode.InnerText))
-        //                                {
-        //                                    listItemPara.AddText(WebUtility.HtmlDecode(textNode.InnerText.Trim()));
-        //                                }
-        //                            }
-
-        //                            // Process line breaks
-        //                            var brNodes = pNode.SelectNodes(".//br");
-        //                            if (brNodes != null)
-        //                            {
-        //                                foreach (var br in brNodes)
-        //                                {
-        //                                    listItemPara.AddLineBreak();
-        //                                }
-        //                            }
-
-        //                            // Process images
-        //                            var imgNodes = pNode.SelectNodes(".//img");
-        //                            if (imgNodes != null)
-        //                            {
-        //                                foreach (var img in imgNodes)
-        //                                {
-        //                                    string imageUrl = img.GetAttributeValue("src", string.Empty);
-        //                                    imageUrl = HttpUtility.HtmlDecode(imageUrl);
-
-        //                                    if (!string.IsNullOrEmpty(imageUrl))
-        //                                    {
-        //                                        AddImageToParaSection(imageUrl, contentCell.Section);
-        //                                    }
-        //                                }
-        //                            }
-        //                        }
-        //                    }
-        //                    else
-        //                    {
-        //                        // Regular list item without paragraphs
-        //                        listItemPara.AddText("• " + WebUtility.HtmlDecode(item.InnerText.Trim()));
-        //                    }
-
-        //                    listItemPara.Format.Font.Color = textColor;
-        //                    listItemPara.Format.Font.Size = 10;
-        //                    listItemPara.Format.SpaceBefore = Unit.FromCentimeter(0.05);
-        //                    listItemPara.Format.SpaceAfter = Unit.FromCentimeter(0.05);
-        //                }
-        //            }
-        //        }
-        //    }
-        //}
-
-        //private void ProcessListContent(Cell contentCell, string mainContent, Color textColor)
-        //{
-        //    var htmlDoc = new HtmlAgilityPack.HtmlDocument();
-        //    htmlDoc.LoadHtml(mainContent);
-
-        //    // Normal text before lists
-        //    var textNodes = htmlDoc.DocumentNode.ChildNodes
-        //        .Where(n => n.NodeType == HtmlNodeType.Text)
-        //        .Select(n => n.InnerText.Trim())
-        //        .Where(t => !string.IsNullOrWhiteSpace(t));
-
-        //    foreach (var text in textNodes)
-        //    {
-        //        Paragraph textPara = contentCell.AddParagraph();
-        //        textPara.AddText(text);
-        //        textPara.Format.Font.Color = textColor;
-        //        textPara.Format.Font.Size = 10;
-        //        textPara.Format.SpaceAfter = Unit.FromCentimeter(0.1);
-        //    }
-
-        //    // Lists
-        //    var lists = htmlDoc.DocumentNode.SelectNodes("//ul");
-        //    if (lists != null)
-        //    {
-        //        foreach (var list in lists)
-        //        {
-        //            var items = list.SelectNodes("./li");
-        //            if (items != null)
-        //            {
-        //                foreach (var item in items)
-        //                {
-        //                    Paragraph listItemPara = contentCell.AddParagraph();
-        //                    listItemPara.Format.LeftIndent = Unit.FromCentimeter(0.3);
-
-        //                    // Add bullet point
-        //                    listItemPara.AddText("• ");
-
-        //                    // Process <p> content (text + images)
-        //                    var paragraphNodes = item.SelectNodes(".//p");
-        //                    if (paragraphNodes != null)
-        //                    {
-        //                        foreach (var pNode in paragraphNodes)
-        //                        {
-        //                            // Text
-        //                            foreach (var textNode in pNode.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text))
-        //                            {
-        //                                if (!string.IsNullOrWhiteSpace(textNode.InnerText))
-        //                                    listItemPara.AddText(WebUtility.HtmlDecode(textNode.InnerText.Trim()));
-        //                            }
-
-        //                            // Images
-        //                            var imgNodes = pNode.SelectNodes(".//img");
-        //                            if (imgNodes != null)
-        //                            {
-        //                                foreach (var img in imgNodes)
-        //                                {
-        //                                    string imageUrl = HttpUtility.HtmlDecode(img.GetAttributeValue("src", ""));
-        //                                    if (!string.IsNullOrEmpty(imageUrl))
-        //                                        AddImageToParaSection(imageUrl, contentCell.Section);
-        //                                }
-        //                            }
-
-        //                            // Line breaks
-        //                            if (pNode.SelectNodes(".//br") != null)
-        //                                listItemPara.AddLineBreak();
-        //                        }
-        //                    }
-
-        //                    // Process <table> inside <li> — must be added to Section
-        //                    var tableNodes = item.SelectNodes(".//table");
-        //                    if (tableNodes != null)
-        //                    {
-        //                        foreach (var tableNode in tableNodes)
-        //                        {
-        //                            RenderHtmlTable(contentCell.Section, tableNode, textColor); // Pass Section, not Cell
-        //                        }
-        //                    }
-
-        //                    listItemPara.Format.Font.Color = textColor;
-        //                    listItemPara.Format.Font.Size = 10;
-        //                    listItemPara.Format.SpaceBefore = Unit.FromCentimeter(0.05);
-        //                    listItemPara.Format.SpaceAfter = Unit.FromCentimeter(0.05);
-        //                }
-        //            }
-        //        }
-        //    }
-        //}
 
         private void ProcessListContent(Cell contentCell, string mainContent, Color textColor)
         {
-            var htmlDoc = new HtmlAgilityPack.HtmlDocument();
-            htmlDoc.LoadHtml(mainContent);
+            HtmlDocument htmlDocument = new HtmlDocument();
+            htmlDocument.LoadHtml(mainContent);
 
-            // Normal text before lists
-            var textNodes = htmlDoc.DocumentNode.ChildNodes
-                .Where(n => n.NodeType == HtmlNodeType.Text)
-                .Select(n => n.InnerText.Trim())
-                .Where(t => !string.IsNullOrWhiteSpace(t));
+            IEnumerable<string> enumerable = from n in htmlDocument.DocumentNode.ChildNodes
+                                             where n.NodeType == HtmlNodeType.Text
+                                             select n.InnerText.Trim() into t
+                                             where !string.IsNullOrWhiteSpace(t)
+                                             select t;
 
-            foreach (var text in textNodes)
+            foreach (string item in enumerable)
             {
-                Paragraph textPara = contentCell.AddParagraph();
-                textPara.AddText(text);
-                textPara.Format.Font.Color = textColor;
-                textPara.Format.Font.Size = 10;
-                textPara.Format.SpaceAfter = Unit.FromCentimeter(0.1);
+                Paragraph paragraph = contentCell.AddParagraph();
+                paragraph.AddText(item);
+                paragraph.Format.Font.Color = textColor;
+                paragraph.Format.Font.Size = 10;
+                paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.1);
             }
 
-            // Lists
-            var lists = htmlDoc.DocumentNode.SelectNodes("//ul");
-            if (lists != null)
+            HtmlNodeCollection htmlNodeCollection = htmlDocument.DocumentNode.SelectNodes("//ul");
+            if (htmlNodeCollection == null) return;
+
+            foreach (HtmlNode item2 in htmlNodeCollection)
             {
-                foreach (var list in lists)
+                HtmlNodeCollection liNodes = item2.SelectNodes("./li");
+                if (liNodes == null) continue;
+
+                foreach (HtmlNode item3 in liNodes)
                 {
-                    var items = list.SelectNodes("./li");
-                    if (items == null) continue;
+                    Paragraph paragraph2 = contentCell.AddParagraph();
+                    paragraph2.AddText("• ");
 
-                    foreach (var item in items)
+                    foreach (HtmlNode item4 in item3.ChildNodes)
                     {
-                        Paragraph listItemPara = contentCell.AddParagraph();
-                        //listItemPara.Format.LeftIndent = Unit.FromCentimeter(0.02);
-                        //listItemPara.Format.FirstLineIndent = Unit.FromCentimeter(-0.02);
-                        listItemPara.AddText("• ");
-
-                        // Process child nodes of li
-                        foreach (var child in item.ChildNodes)
+                        if (item4.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
                         {
-                            if (child.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
+                            foreach (HtmlNode item5 in item4.ChildNodes)
                             {
-                                // Text and images inside <p>
-                                foreach (var pChild in child.ChildNodes)
+                                if (item5.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    if (pChild.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        string imageUrl = HttpUtility.HtmlDecode(pChild.GetAttributeValue("src", ""));
-                                        if (!string.IsNullOrEmpty(imageUrl))
-                                            AddImageToParaSection(imageUrl, contentCell.Section);
-                                    }
-                                    else
-                                    {
-                                        listItemPara.AddText(WebUtility.HtmlDecode(pChild.InnerText));
-                                    }
+                                    string src = HttpUtility.HtmlDecode(item5.GetAttributeValue("src", ""));
+                                    if (!string.IsNullOrEmpty(src))
+                                        AddImageToParaSection(src, contentCell.Section);
                                 }
-                            }
-                            else if (child.Name.Equals("div", StringComparison.OrdinalIgnoreCase))
-                            {
-                                // Look for tables inside divs
-                                var tableNodes = child.SelectNodes(".//table");
-                                if (tableNodes != null)
+                                else
                                 {
-                                    foreach (var tableNode in tableNodes)
-                                    {
-                                        AddTableToDocument(listItemPara, tableNode);
-                                    }
+                                    paragraph2.AddText(WebUtility.HtmlDecode(item5.InnerText));
                                 }
-                            }
-                            else if (child.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                            {
-                                string imageUrl = HttpUtility.HtmlDecode(child.GetAttributeValue("src", ""));
-                                if (!string.IsNullOrEmpty(imageUrl))
-                                    AddImageToParaSection(imageUrl, contentCell.Section);
-                            }
-                            else
-                            {
-                                // Plain text
-                                listItemPara.AddText(WebUtility.HtmlDecode(child.InnerText));
                             }
                         }
-
-                        listItemPara.Format.Font.Color = textColor;
-                        listItemPara.Format.Font.Size = 10;
-                        listItemPara.Format.SpaceBefore = Unit.FromCentimeter(0.05);
-                        listItemPara.Format.SpaceAfter = Unit.FromCentimeter(0.05);
+                        else if (item4.Name.Equals("div", StringComparison.OrdinalIgnoreCase))
+                        {
+                            HtmlNodeCollection tables = item4.SelectNodes(".//table");
+                            if (tables != null)
+                            {
+                                foreach (HtmlNode item6 in tables)
+                                    AddTableToDocument(paragraph2, item6);
+                            }
+                        }
+                        else if (item4.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string src2 = HttpUtility.HtmlDecode(item4.GetAttributeValue("src", ""));
+                            if (!string.IsNullOrEmpty(src2))
+                                AddImageToParaSection(src2, contentCell.Section);
+                        }
+                        else
+                        {
+                            paragraph2.AddText(WebUtility.HtmlDecode(item4.InnerText));
+                        }
                     }
+
+                    paragraph2.Format.Font.Color = textColor;
+                    paragraph2.Format.Font.Size = 10;
+                    paragraph2.Format.SpaceBefore = Unit.FromCentimeter(0.05);
+                    paragraph2.Format.SpaceAfter = Unit.FromCentimeter(0.05);
                 }
             }
         }
 
-
-        private void RenderHtmlTable(Section section, HtmlNode tableNode, Color textColor)
-        {
-            var table = section.AddTable();
-            table.Borders.Width = 0.5;
-            table.Borders.Color = Colors.Gray;
-
-            var firstRow = tableNode.SelectSingleNode(".//tr");
-            int colCount = firstRow?.SelectNodes("./th|./td")?.Count ?? 1;
-
-            for (int i = 0; i < colCount; i++)
-                table.AddColumn(Unit.FromCentimeter(16.0 / colCount));
-
-            foreach (var rowNode in tableNode.SelectNodes(".//tr"))
-            {
-                var row = table.AddRow();
-                int colIndex = 0;
-
-                foreach (var cellNode in rowNode.SelectNodes("./th|./td"))
-                {
-                    var cell = row.Cells[colIndex];
-                    var para = cell.AddParagraph();
-                    para.Format.Font.Color = textColor;
-
-                    // Text
-                    string text = WebUtility.HtmlDecode(cellNode.InnerText.Trim());
-                    if (!string.IsNullOrEmpty(text))
-                        para.AddText(text);
-
-                    // Images
-                    var imgNode = cellNode.SelectSingleNode(".//img");
-                    if (imgNode != null)
-                    {
-                        string src = HttpUtility.HtmlDecode(imgNode.GetAttributeValue("src", ""));
-                        if (!string.IsNullOrEmpty(src))
-                            AddImageToParaSection(src, section); // Add image to section
-                    }
-
-                    colIndex++;
-                }
-            }
-        }
-
+        // =========================================================================
+        // HEADING / PARAGRAPH / IMAGE / LIST
+        // =========================================================================
 
         private void AddHeading(Section section, string text, string style, int fontSize)
         {
-            string strContext = "";
             if (string.IsNullOrWhiteSpace(text)) return;
 
-            Paragraph heading = section.AddParagraph();
-            heading.Style = style;
-            heading.Format.Font.Size = isFirst ? 24 : fontSize;
-            // Bold rule: H1/H2 bold; H3/H4 not bold
+            Paragraph paragraph = section.AddParagraph();
+            paragraph.Style = style;
+            paragraph.Format.Font.Size = (isFirst ? 24 : fontSize);
+
             if (style == "Heading1" || style == "Heading2")
-                heading.Format.Font.Bold = true;
+                paragraph.Format.Font.Bold = true;
             else
-                heading.Format.Font.Bold = false;
-            // Color rule: H1 uses brand color, H2/H3 black
+                paragraph.Format.Font.Bold = false;
+
             if (style == "Heading1")
-                heading.Format.Font.Color = new Color(28, 74, 113);
+                paragraph.Format.Font.Color = new MigraDoc.DocumentObjectModel.Color(28, 74, 113);
             else
-                heading.Format.Font.Color = Colors.Black;
-            // Avoid headings orphaned at the bottom of the page
-            heading.Format.KeepWithNext = true;
-            heading.Format.KeepTogether = true;
+                paragraph.Format.Font.Color = Colors.Black;
 
-            // Clean up the text (remove HTML tags and decode entities)
-            string cleanText = WebUtility.HtmlDecode(StripHtml(text)).Trim();
+            paragraph.Format.KeepWithNext = true;
+            paragraph.Format.KeepTogether = true;
 
-            // Create bookmark for H2 and H3 headings for index navigation
+            string text3 = WebUtility.HtmlDecode(StripHtml(text)).Trim();
+
             if (style == "Heading2" || style == "Heading3")
             {
-                string level = style == "Heading2" ? "H2" : "H3";
-                string bookmarkName = $"{level.ToLower()}_{Guid.NewGuid().ToString("N").Substring(0, 8)}";
-                heading.AddBookmark(bookmarkName);
-
-                // Store heading info for index generation
+                string level = (style == "Heading2") ? "H2" : "H3";
+                string bookmark = level.ToLower() + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+                paragraph.AddBookmark(bookmark);
                 if (headings == null)
-                    headings = new List<(string Title, string Bookmark, string Level)>();
-                headings.Add((cleanText, bookmarkName, level));
+                    headings = new List<(string, string, string)>();
+                headings.Add((text3, bookmark, level));
             }
 
-            //heading.AddText(strContext + " " + cleanText);
-            heading.AddText(cleanText);
-
+            paragraph.AddText(text3);
             isFirst = false;
         }
 
         private void AddParagraph(Section section, HtmlNode node)
         {
-            if (node == null) return;
-
-            Paragraph para = section.AddParagraph();
-            // prevent paragraph splitting across pages and try to keep with next logical block
-            para.Format.KeepTogether = true;
-            para.Format.KeepWithNext = false; // set true if next element should remain on same page
-
-            // Process the paragraph content (may contain spans, links, etc.)
-            ProcessInlineElements(para, node);
+            if (node != null)
+            {
+                Paragraph paragraph = section.AddParagraph();
+                paragraph.Format.KeepTogether = true;
+                paragraph.Format.KeepWithNext = false;
+                ProcessInlineElements(paragraph, node);
+            }
         }
 
-        //private void AddImageToParaSection(string imageUrl, Section section)
-        //{
-        //    try
-        //    {
-        //        // Decode the URL to ensure any special characters are handled properly
-        //        string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-
-        //        // Extract the file name and extension from the URL
-        //        string fileName = Path.GetFileName(new Uri(decodedUrl).AbsolutePath);
-        //        string tempImagePath = Path.Combine(Path.GetTempPath(), fileName);
-
-        //        using (WebClient client = new WebClient())
-        //        {
-        //            // Set headers to mimic a browser request (optional, but recommended)
-        //            client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-
-        //            // Download the image to the temporary path with the correct extension
-        //            client.DownloadFile(decodedUrl, tempImagePath);
-        //        }
-
-        //        // Add the image to the section
-        //        Paragraph paragraph = section.AddParagraph();
-        //        //paragraph.Format.LeftIndent = Unit.FromCentimeter(2);
-        //        //paragraph.Format.RightIndent = Unit.FromCentimeter(2);
-        //        var image = paragraph.AddImage(tempImagePath);
-
-        //        // Calculate the full width of the page
-        //        //Unit pageWidth = section.PageSetup.PageWidth;
-        //        //Unit leftMargin = section.PageSetup.LeftMargin;
-        //        //Unit rightMargin = section.PageSetup.RightMargin;
-        //        //Unit fullWidth = pageWidth - leftMargin - rightMargin;
-
-        //        // Set image dimensions (adjust as needed)
-        //        image.Width = 430; // Adjust width
-        //        image.LockAspectRatio = true; // Maintain aspect ratio
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        Console.WriteLine($"Error processing image: {ex.StackTrace}");
-        //    }
-        //}
-
-        //private void AddImageToParaSection(string imageUrl, Section section)
-        // {
-        //    try
-        //    {
-        //        string decodedUrl = HttpUtility.HtmlDecode(imageUrl);
-        //        decodedUrl = CleanUrl(decodedUrl);
-        //        string fileName = Path.GetFileName(new Uri(decodedUrl).AbsolutePath);
-        //        string tempImagePath = Path.Combine(Path.GetTempPath(), fileName);
-
-        //        using (WebClient client = new WebClient())
-        //        {
-        //            client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-        //            client.DownloadFile(decodedUrl, tempImagePath);
-        //        }
-
-        //        // Add the image to the section
-        //        Paragraph paragraph = section.AddParagraph();
-        //        var image = paragraph.AddImage(tempImagePath);
-        //        image.LockAspectRatio = true;
-
-        //        // Calculate usable page width (account for margins)
-        //        Unit pageWidth = section.PageSetup.PageWidth;
-        //        Unit leftMargin = section.PageSetup.LeftMargin;
-        //        Unit rightMargin = section.PageSetup.RightMargin;
-        //        Unit usableWidth = pageWidth - leftMargin - rightMargin;
-
-        //        // Set a default target width and clamp to the usable width
-        //        Unit targetWidth = Unit.FromCentimeter(15);
-        //        if (targetWidth > usableWidth)
-        //        {
-        //            targetWidth = usableWidth;
-        //        }
-        //        image.Width = targetWidth;
-
-        //        // Center the image in the page
-        //        paragraph.Format.Alignment = ParagraphAlignment.Center;
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        Console.WriteLine($"Error processing image: {ex.Message}");
-        //    }
-        //}
-
-
-
-        //private void AddImagetoPara(Paragraph para, HtmlNode node)
-        //{
-        //    string src = node.GetAttributeValue("src", "");
-        //    if (string.IsNullOrEmpty(src))
-        //        return;
-
-        //    try
-        //    {
-        //        para.Format.Alignment = ParagraphAlignment.Center;
-
-        //        if (src.StartsWith("http") || src.StartsWith("https"))
-        //        {
-        //            // Download external image
-        //            using (WebClient client = new WebClient())
-        //            {
-        //                byte[] imageData = client.DownloadData(src);
-        //                string tempPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() + ".png");
-        //                File.WriteAllBytes(tempPath, imageData);
-
-        //                var image = para.AddImage(tempPath);
-        //                image.LockAspectRatio = true;
-
-        //                // Compute usable page width (paragraph-level image)
-        //                Section section = para.Section;
-        //                Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
-
-        //                // Default target width of 15cm, but never exceed container width
-        //                Unit targetWidth = Unit.FromCentimeter(15);
-        //                if (targetWidth > containerWidth)
-        //                {
-        //                    targetWidth = containerWidth;
-        //                }
-        //                image.Width = targetWidth;
-
-        //                // Clean up temp file
-        //                File.Delete(tempPath);
-        //            }
-        //        }
-        //        else if (src.StartsWith("~/"))
-        //        {
-        //            // Local image
-        //            string localPath = HttpContext.Current.Server.MapPath(src);
-        //            if (File.Exists(localPath))
-        //            {
-        //                var image = para.AddImage(localPath);
-        //                image.LockAspectRatio = true;
-
-        //                // Compute usable page width (paragraph-level image)
-        //                Section section = para.Section;
-        //                Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
-
-        //                // Default target width of 15cm, but never exceed container width
-        //                Unit targetWidth = Unit.FromCentimeter(15);
-        //                if (targetWidth > containerWidth)
-        //                {
-        //                    targetWidth = containerWidth;
-        //                }
-        //                image.Width = targetWidth;
-        //            }
-        //        }
-        //    }
-        //    catch (Exception ex)
-        //    {
-        //        // Log error and add placeholder text
-        //        Console.WriteLine($"Error adding image {src}: {ex.Message}");
-
-        //    }
-        //}
-
+        // Change #5: Use image cache
         private void AddImageToParaSection(string imageUrl, Section section)
         {
+            string localPath = null;
+            bool downloadedByUs = false;
             try
             {
-                string cachedPath = DownloadImageCached(imageUrl);
-                if (cachedPath == null) return;
+                string url = HttpUtility.HtmlDecode(imageUrl);
+                url = CleanUrl(url);
 
-                Unit imageNativeWidth;
-                using (var img = System.Drawing.Image.FromFile(cachedPath))
+                localPath = DownloadImageCached(url);
+                if (localPath == null) return;
+
+                Unit unit;
+                using (System.Drawing.Image image = System.Drawing.Image.FromFile(localPath))
                 {
-                    double widthInPoints = (double)img.Width / img.HorizontalResolution * 72;
-                    imageNativeWidth = Unit.FromPoint(widthInPoints);
+                    double value = (double)image.Width / (double)image.HorizontalResolution * 72.0;
+                    unit = Unit.FromPoint(value);
                 }
 
                 Paragraph paragraph = section.AddParagraph();
-                var image = paragraph.AddImage(cachedPath);
-                image.LockAspectRatio = true;
+                Image image2 = paragraph.AddImage(localPath);
+                image2.LockAspectRatio = true;
                 paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.5);
                 paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.5);
+
                 Unit pageWidth = section.PageSetup.PageWidth;
                 Unit leftMargin = section.PageSetup.LeftMargin;
                 Unit rightMargin = section.PageSetup.RightMargin;
-                Unit usableWidth = pageWidth - leftMargin - rightMargin;
-
-                double finalWidthInPoints = Math.Min(imageNativeWidth.Point, usableWidth.Point);
-                image.Width = Unit.FromPoint(finalWidthInPoints);
-
+                Unit unit2 = pageWidth - leftMargin - rightMargin;
+                double value2 = Math.Min(unit.Point, unit2.Point);
+                image2.Width = Unit.FromPoint(value2);
                 paragraph.Format.Alignment = ParagraphAlignment.Center;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error processing image: {ex.Message}");
+                Console.WriteLine("Error processing image: " + ex.Message);
             }
         }
 
         private void ProcessInlineElements(Paragraph para, HtmlNode node, string titleText = null)
         {
-            if (titleText == "")
-
-                if (node == null) return;
-
-            if (node.InnerText.IndexOf("Nomadix offers a Software Development Kit (SDK) for easy app integration") > 0)
-            {
-
-                string str = "";
-
-            }
+            if (titleText == "" && node == null) return;
 
             if (titleText != null && !string.IsNullOrWhiteSpace(titleText.Trim()))
             {
-                string iconFile = titleText.Trim().Equals("Note", StringComparison.OrdinalIgnoreCase)
-                                   ? "~/logo/info_icon.png"
-                                   : "~/logo/warning_icon.png";
-                string iconPath = HttpContext.Current.Server.MapPath(iconFile);
-
+                string path = titleText.Trim().Equals("Note", StringComparison.OrdinalIgnoreCase)
+                    ? "~/logo/info_icon.png"
+                    : "~/logo/warning_icon.png";
+                string iconPath = HttpContext.Current.Server.MapPath(path);
                 if (File.Exists(iconPath))
                 {
-                    var iconImg = para.AddImage(iconPath);
-                    iconImg.Width = Unit.FromCentimeter(0.6);
-                    iconImg.LockAspectRatio = true;
-                    iconImg.WrapFormat.Style = WrapStyle.Through; // Changed to Inline for better text flow
-                    iconImg.Top = ShapePosition.Top;
-                    iconImg.Left = ShapePosition.Left;
-
-                    // Add space between icon and title
+                    Image image = para.AddImage(iconPath);
+                    image.Width = Unit.FromCentimeter(0.6);
+                    image.LockAspectRatio = true;
+                    image.WrapFormat.Style = WrapStyle.Through;
+                    image.Top = ShapePosition.Top;
+                    image.Left = ShapePosition.Left;
                     para.AddText(" ");
                 }
             }
 
-            // Add title with line break if it exists
             if (titleText != null)
             {
                 para.AddText(titleText);
                 para.AddLineBreak();
             }
 
-
-            foreach (var childNode in node.ChildNodes)
+            foreach (HtmlNode item in node.ChildNodes)
             {
-
-                if (childNode.NodeType == HtmlNodeType.Text)
+                if (item.NodeType == HtmlNodeType.Text)
                 {
-                    if (!string.IsNullOrWhiteSpace(childNode.InnerText))
+                    if (!string.IsNullOrWhiteSpace(item.InnerText))
                     {
-                        // Add icon if titleText exists
-                        // Add the main content text
-                        para.AddText(WebUtility.HtmlDecode(childNode.InnerText));
-
-                        // Format the paragraph
-                        para.Format.SpaceBefore = Unit.FromPoint(6);
-                        para.Format.SpaceAfter = Unit.FromPoint(6);
-
-
+                        para.AddText(WebUtility.HtmlDecode(item.InnerText));
+                        para.Format.SpaceBefore = Unit.FromPoint(6.0);
+                        para.Format.SpaceAfter = Unit.FromPoint(6.0);
                     }
                 }
-                else if (childNode.NodeType == HtmlNodeType.Element)
+                else if (item.NodeType == HtmlNodeType.Element)
                 {
-
-                    if (childNode.Name == "div" && childNode.HasClass("table-shadow-wrapper"))
+                    if (item.Name == "div" && item.HasClass("table-shadow-wrapper"))
                     {
-                        // Handle table wrapper div
-                        var tableNode = childNode.SelectSingleNode(".//table");
-                        if (tableNode != null)
-                        {
-                            Console.WriteLine("Found table-shadow-wrapper with table, calling AddTableToDocument");
-                            AddTableToDocument(para, tableNode);
-                        }
-                        else
-                        {
-                            Console.WriteLine("Found table-shadow-wrapper but no table inside");
-                        }
+                        HtmlNode htmlNode = item.SelectSingleNode(".//table");
+                        if (htmlNode != null)
+                            AddTableToDocument(para, htmlNode);
                         continue;
                     }
-                    else
+
+                    switch (item.Name.ToLower())
                     {
-
-                        switch (childNode.Name.ToLower())
-                        {
-                            case "b":
-                            case "strong":
-                                var boldText = para.AddFormattedText(WebUtility.HtmlDecode(childNode.InnerText));
-                                boldText.Bold = true;
-                                para.Format.SpaceBefore = Unit.FromPoint(6); // Add space before each list item
-                                para.Format.SpaceAfter = Unit.FromPoint(6);  // Add space after each list item
-                                break;
-                            case "em":
-                            case "i":
-                                var italicText = para.AddFormattedText(WebUtility.HtmlDecode(childNode.InnerText));
-                                italicText.Italic = true;
-                                break;
-                            case "u":
-                                var underlineText = para.AddFormattedText(WebUtility.HtmlDecode(childNode.InnerText));
-                                underlineText.Underline = Underline.Single;
-                                break;
-                            case "a":
-                                var linkText = para.AddFormattedText(WebUtility.HtmlDecode(childNode.InnerText));
-                                linkText.Color = new Color(0, 106, 138); // Nomadix teal color for links
-                                linkText.Underline = Underline.Single;
-                                break;
-                            case "ul":
-                                AddListNoSection(para, childNode, false);
-                                break;
-                            case "span":
-                            case "div":
-                            case "p":
-                                // Process span content recursively
-                                ProcessInlineElements(para, childNode);
-                                break;
-                            case "figure":
-
-                                // Images
-                                var imgNode = childNode.SelectSingleNode(".//img");
-                                if (imgNode != null)
-                                {
-                                    string src = HttpUtility.HtmlDecode(imgNode.GetAttributeValue("src", ""));
-                                    if (!string.IsNullOrEmpty(src))
-                                        AddImageToParaSection(src, para.Section); // Add image to section
-                                }
-
-                                //// Handle figures with nested images and optional captions
-                                //var nestedImg = childNode.SelectSingleNode(".//img");
-                                //if (nestedImg != null)
-                                //{
-                                //    var _imageUrl = nestedImg.GetAttributeValue("src", string.Empty);
-                                //    _imageUrl = HttpUtility.HtmlDecode(_imageUrl);
-                                //    _imageUrl = CleanUrl(_imageUrl);
-                                //    if (!string.IsNullOrEmpty(_imageUrl))
-                                //    {
-                                //        AddImageToParaSection(_imageUrl, para.Section);
-                                //    }
-                                //}
-                                //// Optional figcaption rendering
-                                //var captionNode = childNode.SelectSingleNode(".//figcaption");
-                                //if (captionNode != null && !string.IsNullOrWhiteSpace(captionNode.InnerText))
-                                //{
-                                //    var captionText = WebUtility.HtmlDecode(captionNode.InnerText.Trim());
-                                //    var ft = para.AddFormattedText(captionText);
-                                //    ft.Italic = true;
-                                //    para.AddLineBreak();
-                                //}
-                                break;
-                            case "br":
+                        case "b":
+                        case "strong":
+                            FormattedText formattedText5 = para.AddFormattedText(WebUtility.HtmlDecode(item.InnerText));
+                            formattedText5.Bold = true;
+                            para.Format.SpaceBefore = Unit.FromPoint(6.0);
+                            para.Format.SpaceAfter = Unit.FromPoint(6.0);
+                            break;
+                        case "i":
+                        case "em":
+                            FormattedText formattedText4 = para.AddFormattedText(WebUtility.HtmlDecode(item.InnerText));
+                            formattedText4.Italic = true;
+                            break;
+                        case "u":
+                            FormattedText formattedText3 = para.AddFormattedText(WebUtility.HtmlDecode(item.InnerText));
+                            formattedText3.Underline = Underline.Single;
+                            break;
+                        case "a":
+                            FormattedText formattedText2 = para.AddFormattedText(WebUtility.HtmlDecode(item.InnerText));
+                            formattedText2.Color = new MigraDoc.DocumentObjectModel.Color(0, 106, 138);
+                            formattedText2.Underline = Underline.Single;
+                            break;
+                        case "ul":
+                            AddListNoSection(para, item, isOrdered: false);
+                            break;
+                        case "p":
+                        case "div":
+                        case "span":
+                            ProcessInlineElements(para, item);
+                            break;
+                        case "figure":
+                            HtmlNode htmlNode2 = item.SelectSingleNode(".//img");
+                            if (htmlNode2 != null)
+                            {
+                                string text3 = HttpUtility.HtmlDecode(htmlNode2.GetAttributeValue("src", ""));
+                                if (!string.IsNullOrEmpty(text3))
+                                    AddImageToParaSection(text3, para.Section);
+                            }
+                            break;
+                        case "br":
+                            para.AddLineBreak();
+                            break;
+                        case "img":
+                            string attributeValue2 = item.GetAttributeValue("src", string.Empty);
+                            attributeValue2 = HttpUtility.HtmlDecode(attributeValue2);
+                            attributeValue2 = CleanUrl(attributeValue2);
+                            if (!string.IsNullOrEmpty(attributeValue2))
+                                AddImageToParaSection(attributeValue2, para.Section);
+                            break;
+                        case "video":
+                            string attributeValue = item.GetAttributeValue("src", string.Empty);
+                            attributeValue = HttpUtility.HtmlDecode(attributeValue);
+                            attributeValue = CleanUrl(attributeValue);
+                            if (!string.IsNullOrEmpty(attributeValue))
+                            {
+                                Hyperlink hyperlink = para.AddHyperlink(attributeValue, HyperlinkType.Web);
+                                FormattedText formattedText = hyperlink.AddFormattedText("Click here to view Video");
+                                formattedText.Color = new MigraDoc.DocumentObjectModel.Color(0, 106, 138);
+                                formattedText.Underline = Underline.Single;
                                 para.AddLineBreak();
-                                break;
-                            case "img":
-                                string imageUrl = childNode.GetAttributeValue("src", string.Empty);
-                                imageUrl = HttpUtility.HtmlDecode(imageUrl);
-                                imageUrl = CleanUrl(imageUrl);
-
-                                if (!string.IsNullOrEmpty(imageUrl))
-                                {
-                                    AddImageToParaSection(imageUrl, para.Section);
-                                }
-                                break;
-                            case "video":
-                                // PDFs do not support embedded video; render a clickable URL fallback
-                                var videoUrl = childNode.GetAttributeValue("src", string.Empty);
-                                videoUrl = HttpUtility.HtmlDecode(videoUrl);
-                                videoUrl = CleanUrl(videoUrl);
-
-
-                                const string THUMBNAIL_PATH = "https://www.citypng.com/public/uploads/preview/video-cinema-clap-black-icon-png-image-7017516950353797kbrvcrxz0.png";
-                                if (!string.IsNullOrEmpty(videoUrl) && File.Exists(THUMBNAIL_PATH))
-                                {
-                                    // 1. Create the Hyperlink object within the paragraph
-                                    //var hyperlink = para.AddHyperlink(videoUrl, MigraDoc.DocumentObjectModel.HyperlinkType.Web);
-                                    var hyperlink = para.AddHyperlink(videoUrl, HyperlinkType.Web);
-                                    // 2. Add the Image as the content of the Hyperlink object
-                                    MigraDoc.DocumentObjectModel.Shapes.Image image = hyperlink.AddImage(THUMBNAIL_PATH);
-                                    para.Format.SpaceBefore = Unit.FromCentimeter(0.5);
-                                    para.Format.SpaceAfter = Unit.FromCentimeter(0.5);
-                                    // 3. Set image dimensions and styling (on the image object)
-                                    image.Width = MigraDoc.DocumentObjectModel.Unit.FromCentimeter(5);
-                                    image.Height = MigraDoc.DocumentObjectModel.Unit.FromCentimeter(3);
-                                    image.LockAspectRatio = true;
-
-                                    // NOTE: Layout properties like WrapFormat and Left/Right/Top/Bottom 
-                                    // need to be set on the Image object itself.
-
-                                    var _linkText = hyperlink.AddFormattedText("Click here to view Video");
-                                    _linkText.Color = new Color(0, 106, 138);
-                                    _linkText.Underline = Underline.Single;
-                                    para.AddLineBreak();
-                                }
-                                break;
-
-                            default:
-                                // For other elements, just add the text
-                                if (!string.IsNullOrWhiteSpace(childNode.InnerText))
-                                {
-                                    para.AddText(WebUtility.HtmlDecode(childNode.InnerText));
-                                    para.Format.SpaceBefore = Unit.FromPoint(6); // Add space before each list item
-                                    para.Format.SpaceAfter = Unit.FromPoint(6);  // Add space after each list item
-                                }
-                                break;
-                        }
+                            }
+                            break;
+                        default:
+                            if (!string.IsNullOrWhiteSpace(item.InnerText))
+                            {
+                                para.AddText(WebUtility.HtmlDecode(item.InnerText));
+                                para.Format.SpaceBefore = Unit.FromPoint(6.0);
+                                para.Format.SpaceAfter = Unit.FromPoint(6.0);
+                            }
+                            break;
                     }
                 }
             }
         }
+
+        // =========================================================================
+        // TABLES (production proven logic)
+        // =========================================================================
+
         private void AddTableToDocument(Paragraph para, HtmlNode tableNode)
         {
-            var section = para.Section;
-            var table = section.AddTable();
+            Section section = para.Section;
+            Table table = section.AddTable();
             table.Borders.Width = 0.5;
 
-            // Determine number of columns
-            var firstRow = tableNode.SelectSingleNode(".//tr");
-            if (firstRow == null) return;
-            var cells = firstRow.SelectNodes("./th|./td");
-            if (cells == null || cells.Count == 0) return;
-            int columnCount = cells.Count;
+            HtmlNode htmlNode = tableNode.SelectSingleNode(".//tr");
+            if (htmlNode == null) return;
 
-            // Calculate dynamic column widths based on content
-            double[] columnWidths = CalculateColumnWidths(tableNode, columnCount);
-            for (int i = 0; i < columnCount; i++)
+            HtmlNodeCollection htmlNodeCollection = htmlNode.SelectNodes("./th|./td");
+            if (htmlNodeCollection == null || htmlNodeCollection.Count == 0) return;
+
+            int count = htmlNodeCollection.Count;
+            double[] array = CalculateColumnWidths(tableNode, count);
+
+            for (int i = 0; i < count; i++)
+                table.AddColumn(Unit.FromCentimeter(array[i]));
+
+            HtmlNodeCollection htmlNodeCollection2 = tableNode.SelectNodes(".//tr");
+            if (htmlNodeCollection2 == null) return;
+
+            int rowIndex = 0;
+            foreach (HtmlNode item in htmlNodeCollection2)
             {
-                table.AddColumn(Unit.FromCentimeter(columnWidths[i]));
-            }
+                Row row = table.AddRow();
+                HtmlNodeCollection htmlNodeCollection3 = item.SelectNodes("./th|./td");
+                if (htmlNodeCollection3 == null) continue;
 
-            // Add rows and cells
-            var rows = tableNode.SelectNodes(".//tr");
-            if (rows == null) return;
-
-            var firstrowindex = 0;
-            foreach (var rowNode in rows)
-            {
-
-                var newRow = table.AddRow();
-                var rowCells = rowNode.SelectNodes("./th|./td");
-                if (rowCells == null) continue;
-
-                for (int i = 0; i < rowCells.Count && i < table.Columns.Count; i++)
+                for (int j = 0; j < htmlNodeCollection3.Count && j < table.Columns.Count; j++)
                 {
-                    var cell = newRow.Cells[i];
-                    var paragraph = cell.AddParagraph();
+                    Cell cell = row.Cells[j];
+                    Paragraph paragraph = cell.AddParagraph();
 
-                    foreach (var content in rowCells[i].ChildNodes)
+                    foreach (HtmlNode item2 in htmlNodeCollection3[j].ChildNodes)
                     {
-                        if (content.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                        if (item2.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
                         {
-                            // Inside a table cell: use the current cell's column width minus padding
-                            int colIndex = cell.Column.Index;
-                            Unit colWidth = cell.Table.Columns[colIndex].Width;
-                            AddImageToParagraph(paragraph, content, colWidth - Unit.FromCentimeter(0.2));
+                            int index = cell.Column.Index;
+                            Unit width = cell.Table.Columns[index].Width;
+                            AddImageToParagraph(paragraph, item2, width - Unit.FromCentimeter(0.2));
                         }
-                        else if (content.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
+                        else if (item2.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
                         {
-                            // Render inline content inside <p> within table cells, preserving <strong>/<b>
-                            foreach (var pContent in content.ChildNodes)
+                            foreach (HtmlNode item3 in item2.ChildNodes)
                             {
-                                if (pContent.InnerText == "Site Code")
+                                if (item3.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    var a = "";
-                                }
-                                if (pContent.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                                {
-
-
-                                    // Direct image handling for images in paragraphs inside table cells
-                                    var src = pContent.GetAttributeValue("src", "");
-                                    if (!string.IsNullOrEmpty(src))
+                                    try
                                     {
-                                        try
-                                        {
-                                            int colIndex2 = cell.Column.Index;
-                                            Unit colWidth2 = cell.Table.Columns[colIndex2].Width;
-                                            AddImageToParagraph(paragraph, pContent, colWidth2 - Unit.FromCentimeter(0.2));
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            paragraph.AddText("[Image could not be loaded - ]" + ex.Message);
-                                            Debug.WriteLine($"Image load error: {ex.Message}");
-                                        }
+                                        int index2 = cell.Column.Index;
+                                        Unit width2 = cell.Table.Columns[index2].Width;
+                                        AddImageToParagraph(paragraph, item3, width2 - Unit.FromCentimeter(0.2));
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        paragraph.AddText("[Image could not be loaded - ]" + ex.Message);
                                     }
                                 }
-                                else if (pContent.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) ||
-                                         pContent.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
+                                else if (item3.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) || item3.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(pContent.InnerText));
-                                    ft.Bold = true;
+                                    FormattedText formattedText = paragraph.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
+                                    formattedText.Bold = true;
                                 }
-                                else if (pContent.Name.Equals("em", StringComparison.OrdinalIgnoreCase) ||
-                                         pContent.Name.Equals("i", StringComparison.OrdinalIgnoreCase))
+                                else if (item3.Name.Equals("em", StringComparison.OrdinalIgnoreCase) || item3.Name.Equals("i", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(pContent.InnerText));
-                                    ft.Italic = true;
+                                    FormattedText formattedText2 = paragraph.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
+                                    formattedText2.Italic = true;
                                 }
-                                else if (pContent.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
+                                else if (item3.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(pContent.InnerText));
-                                    ft.Underline = Underline.Single;
+                                    FormattedText formattedText3 = paragraph.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
+                                    formattedText3.Underline = Underline.Single;
                                 }
-                                else if (pContent.NodeType == HtmlNodeType.Text)
+                                else if (item3.NodeType == HtmlNodeType.Text)
                                 {
-                                    var text = pContent.InnerText;
-                                    if (!string.IsNullOrWhiteSpace(text))
-                                    {
-                                        if (firstrowindex == 0)
-                                        {
-                                            var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(text));
-                                            ft.Bold = true;
-                                        }
-                                        else
-                                        {
-                                            paragraph.AddText(WebUtility.HtmlDecode(text));
-                                        }
-                                    }
+                                    string innerText = item3.InnerText;
+                                    if (!string.IsNullOrWhiteSpace(innerText))
+                                        paragraph.AddText(WebUtility.HtmlDecode(innerText));
                                 }
                                 else
                                 {
-                                    // Fallback: add decoded inner text
-                                    var text = pContent.InnerText;
-                                    if (!string.IsNullOrWhiteSpace(text))
-                                    {
-                                        if (firstrowindex == 0)
-                                        {
-                                            var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(text));
-                                            ft.Bold = true;
-
-                                        }
-                                        else
-                                        {
-                                            paragraph.AddText(WebUtility.HtmlDecode(text));
-                                        }
-                                        
-                                    }
-
-
+                                    string innerText2 = item3.InnerText;
+                                    if (!string.IsNullOrWhiteSpace(innerText2))
+                                        paragraph.AddText(WebUtility.HtmlDecode(innerText2));
                                 }
                             }
-                            
-                            paragraph.Format.SpaceAfter = Unit.FromPoint(6);
-                            paragraph.Format.SpaceBefore = Unit.FromPoint(6);
+                            paragraph.Format.SpaceAfter = Unit.FromPoint(6.0);
+                            paragraph.Format.SpaceBefore = Unit.FromPoint(6.0);
                         }
                         else
                         {
-                            if (firstrowindex == 0)
+                            if (rowIndex == 0)
                             {
-                                var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(content.InnerText));
-                                ft.Bold = true;
-
+                                FormattedText formattedText6 = paragraph.AddFormattedText(WebUtility.HtmlDecode(item2.InnerText));
+                                formattedText6.Bold = true;
                             }
                             else
                             {
-                                paragraph.AddText(WebUtility.HtmlDecode(content.InnerText));
-                            }                            
-                            paragraph.Format.SpaceAfter = Unit.FromPoint(6);
-                            paragraph.Format.SpaceBefore = Unit.FromPoint(6);
-
-                            
+                                paragraph.AddText(WebUtility.HtmlDecode(item2.InnerText));
+                            }
+                            paragraph.Format.SpaceAfter = Unit.FromPoint(6.0);
+                            paragraph.Format.SpaceBefore = Unit.FromPoint(6.0);
                         }
                     }
                 }
-                if(firstrowindex == 0)
-                    newRow.Shading.Color = new Color(180, 180, 180);
-                firstrowindex++;
+                rowIndex++;
             }
         }
 
-        //private void AddImageToParagraph(Paragraph para, HtmlNode imgNode)
-        //{
-
-        //    var src = imgNode.GetAttributeValue("src", "");
-        //    if (!string.IsNullOrEmpty(src))
-        //    {
-        //        try
-        //        {
-        //            using (var client = new WebClient())
-        //            {
-        //                client.Headers.Add("User-Agent", "Mozilla/5.0");
-        //                var tempPath = Path.GetTempFileName();
-
-        //                try
-        //                {
-        //                    client.DownloadFile(src, tempPath);
-
-        //                    var image = para.AddImage(tempPath);
-
-        //                    // Read attributes
-        //                    var widthAttr = imgNode.GetAttributeValue("width", "");
-        //                    var styleAttr = imgNode.GetAttributeValue("style", "");
-
-        //                    // Extract width from style="width:..."
-        //                    int styleWidth = 0;
-        //                    if (!string.IsNullOrEmpty(styleAttr))
-        //                    {
-        //                        var widthMatch = Regex.Match(styleAttr, @"width\s*:\s*([0-9]+)px", RegexOptions.IgnoreCase);
-        //                        if (widthMatch.Success)
-        //                        {
-        //                            int.TryParse(widthMatch.Groups[1].Value, out styleWidth);
-        //                        }
-        //                    }
-
-        //                    // Available max width (page or column – here I assume ~16 cm for A4 minus margins)
-        //                    Unit maxWidth = Unit.FromCentimeter(16);
-
-        //                    bool sizeSet = false;
-
-        //                    // Priority 1: HTML width attribute
-        //                    if (!string.IsNullOrEmpty(widthAttr) && int.TryParse(widthAttr, out int widthPx))
-        //                    {
-        //                        image.Width = Unit.FromPoint(widthPx * 0.75); // px → pt
-        //                        sizeSet = true;
-        //                    }
-        //                    // Priority 2: CSS style width
-        //                    else if (styleWidth > 0)
-        //                    {
-        //                        image.Width = Unit.FromPoint(styleWidth * 0.75); // px → pt
-        //                        sizeSet = true;
-        //                    }
-        //                    // Priority 3: Default fit
-        //                    if (!sizeSet)
-        //                    {
-        //                        image.LockAspectRatio = true;
-        //                        image.Width = maxWidth;
-        //                    }
-
-        //                    // Final safeguard: clamp to max width
-        //                    if (image.Width > maxWidth)
-        //                    {
-        //                        image.LockAspectRatio = true;
-        //                        image.Width = maxWidth;
-        //                    }
-
-        //                    // Center image
-        //                    para.Format.Alignment = ParagraphAlignment.Center;
-        //                    image.LockAspectRatio = true;
-        //                }
-        //                finally
-        //                {
-        //                    if (File.Exists(tempPath))
-        //                    {
-        //                        File.Delete(tempPath);
-        //                    }
-        //                }
-        //            }
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            para.AddText("[Image could not be loaded - AddImageToParagraph]" + ex.Message);
-        //            Debug.WriteLine($"Image load error: {ex.Message}");
-        //        }
-        //    }
-        //}
         private void AddImageToParagraph(Paragraph para, HtmlNode imgNode, Unit? containerWidthOverride = null)
         {
-            var src = imgNode.GetAttributeValue("src", "");
-            if (string.IsNullOrEmpty(src)) return;
+            string attributeValue = imgNode.GetAttributeValue("src", "");
+            if (string.IsNullOrEmpty(attributeValue)) return;
 
             try
             {
-                string cachedPath = DownloadImageCached(src);
-                if (cachedPath == null) return;
+                string url = HttpUtility.HtmlDecode(attributeValue);
+                url = CleanUrl(url);
 
-                var image = para.AddImage(cachedPath);
+                // Change #5: Use image cache
+                string localPath = DownloadImageCached(url);
+                if (localPath == null) return;
+
+                Image image = para.AddImage(localPath);
                 image.LockAspectRatio = true;
                 para.Format.SpaceBefore = Unit.FromCentimeter(0.5);
                 para.Format.SpaceAfter = Unit.FromCentimeter(0.5);
 
-                Unit containerWidth;
+                Unit unit;
                 if (containerWidthOverride.HasValue)
                 {
-                    containerWidth = containerWidthOverride.Value;
+                    unit = containerWidthOverride.Value;
                 }
                 else
                 {
@@ -2622,84 +1693,79 @@ namespace PickupAPi.Controllers
                     Unit pageWidth = section.PageSetup.PageWidth;
                     Unit leftMargin = section.PageSetup.LeftMargin;
                     Unit rightMargin = section.PageSetup.RightMargin;
-                    containerWidth = pageWidth - leftMargin - rightMargin;
+                    unit = pageWidth - leftMargin - rightMargin;
                 }
 
-                Unit targetWidth = Unit.FromCentimeter(15);
-                if (targetWidth > containerWidth)
-                    targetWidth = containerWidth;
-                image.Width = targetWidth;
-
+                Unit unit2 = Unit.FromCentimeter(15.0);
+                if (unit2 > unit)
+                    unit2 = unit;
+                image.Width = unit2;
                 para.Format.Alignment = ParagraphAlignment.Center;
             }
             catch (Exception ex)
             {
-                para.AddText($"[Image could not be loaded] {ex.Message}");
-                Debug.WriteLine($"Image load error: {ex.Message}");
+                para.AddText("[Image could not be loaded] " + ex.Message);
             }
         }
-
-
 
         private void AddListNoSection(Paragraph para, HtmlNode node, bool isOrdered)
         {
             if (node == null) return;
 
-            int itemNumber = 1;
-            foreach (var listItem in node.SelectNodes("./li"))
+            int num = 1;
+            foreach (HtmlNode item in node.SelectNodes("./li"))
             {
-                Paragraph itemPara = para.Section.AddParagraph();
-                itemPara.Format.LeftIndent = Unit.FromCentimeter(1.0);
-                itemPara.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
-                itemPara.Format.SpaceBefore = Unit.FromPoint(6);
-                itemPara.Format.SpaceAfter = Unit.FromPoint(6);
-                itemPara.Format.LineSpacing = Unit.FromPoint(10);
+                Paragraph paragraph = para.Section.AddParagraph();
+                paragraph.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                paragraph.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
+                paragraph.Format.SpaceBefore = Unit.FromPoint(6.0);
+                paragraph.Format.SpaceAfter = Unit.FromPoint(6.0);
+                paragraph.Format.LineSpacing = Unit.FromPoint(10.0);
 
                 if (isOrdered)
                 {
-                    itemPara.AddText($"{itemNumber}. ");
-                    itemNumber++;
+                    paragraph.AddText($"{num}. ");
+                    num++;
                 }
                 else
                 {
-                    itemPara.AddText("• ");
+                    paragraph.AddText("• ");
                 }
 
-                var paragraphNodes = listItem.SelectNodes(".//p");
-                if (paragraphNodes != null && paragraphNodes.Count > 0)
+                HtmlNodeCollection htmlNodeCollection = item.SelectNodes(".//p");
+                if (htmlNodeCollection != null && htmlNodeCollection.Count > 0)
                 {
-                    foreach (var pNode in paragraphNodes)
+                    foreach (HtmlNode item2 in htmlNodeCollection)
                     {
-                        var textNodes = pNode.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text);
-                        foreach (var textNode in textNodes)
+                        IEnumerable<HtmlNode> enumerable = item2.ChildNodes.Where((HtmlNode n) => n.NodeType == HtmlNodeType.Text);
+                        foreach (HtmlNode item3 in enumerable)
                         {
-                            if (!string.IsNullOrWhiteSpace(textNode.InnerText))
-                                itemPara.AddText(WebUtility.HtmlDecode(textNode.InnerText.Trim()));
+                            if (!string.IsNullOrWhiteSpace(item3.InnerText))
+                                paragraph.AddText(WebUtility.HtmlDecode(item3.InnerText.Trim()));
                         }
 
-                        var brNodes = pNode.SelectNodes(".//br");
+                        HtmlNodeCollection brNodes = item2.SelectNodes(".//br");
                         if (brNodes != null)
                         {
-                            foreach (var br in brNodes)
-                                itemPara.AddLineBreak();
+                            foreach (HtmlNode item4 in brNodes)
+                                paragraph.AddLineBreak();
                         }
 
-                        var imgNodes = pNode.SelectNodes(".//img");
+                        HtmlNodeCollection imgNodes = item2.SelectNodes(".//img");
                         if (imgNodes != null)
                         {
-                            foreach (var img in imgNodes)
+                            foreach (HtmlNode item5 in imgNodes)
                             {
-                                string imageUrl = img.GetAttributeValue("src", string.Empty);
-                                imageUrl = HttpUtility.HtmlDecode(imageUrl);
-                                if (!string.IsNullOrEmpty(imageUrl))
-                                    AddImageToParaSection(imageUrl, itemPara.Section);
+                                string src = HttpUtility.HtmlDecode(item5.GetAttributeValue("src", string.Empty));
+                                if (!string.IsNullOrEmpty(src))
+                                    AddImageToParaSection(src, paragraph.Section);
                             }
                         }
                     }
                 }
                 else
                 {
-                    ProcessInlineElements(itemPara, listItem);
+                    ProcessInlineElements(paragraph, item);
                 }
             }
         }
@@ -2708,951 +1774,372 @@ namespace PickupAPi.Controllers
         {
             if (node == null) return;
 
-            int itemNumber = 1;
-            foreach (var listItem in node.SelectNodes("./li"))
+            int num = 1;
+            foreach (HtmlNode item in node.SelectNodes("./li"))
             {
-                Paragraph para = section.AddParagraph();
-                para.Format.LeftIndent = Unit.FromCentimeter(1.0);
-                para.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
-                para.Format.SpaceBefore = Unit.FromPoint(6);
-                para.Format.SpaceAfter = Unit.FromPoint(6);
-                para.Format.LineSpacing = Unit.FromPoint(10);
+                Paragraph paragraph = section.AddParagraph();
+                paragraph.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                paragraph.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
+                paragraph.Format.SpaceBefore = Unit.FromPoint(6.0);
+                paragraph.Format.SpaceAfter = Unit.FromPoint(6.0);
+                paragraph.Format.LineSpacing = Unit.FromPoint(10.0);
 
                 if (isOrdered)
                 {
-                    para.AddText($"{itemNumber}. ");
-                    itemNumber++;
+                    paragraph.AddText($"{num}. ");
+                    num++;
                 }
                 else
                 {
-                    para.AddText("• ");
+                    paragraph.AddText("• ");
                 }
 
-                ProcessInlineElements(para, listItem);
+                ProcessInlineElements(paragraph, item);
             }
         }
 
         private static bool HasBoldStyle(HtmlNode node)
         {
-            var style = node.GetAttributeValue("style", "")?.ToLowerInvariant();
-            if (string.IsNullOrEmpty(style)) return false;
-            // crude but effective check
-            return style.Contains("font-weight:") && (style.Contains("bold") || style.Contains("700") || style.Contains("800") || style.Contains("900"));
+            string text = node.GetAttributeValue("style", "")?.ToLowerInvariant();
+            if (string.IsNullOrEmpty(text)) return false;
+            if (text.Contains("font-weight:"))
+            {
+                if (!text.Contains("bold") && !text.Contains("700") && !text.Contains("800"))
+                    return text.Contains("900");
+                return true;
+            }
+            return false;
         }
 
         private void AddTable(Section section, HtmlNode node)
         {
             if (node == null) return;
 
-            // Start table on a fresh page (as you had)
-            var pageBreak = section.AddParagraph();
-            pageBreak.Format.PageBreakBefore = true;
-            pageBreak.Format.SpaceBefore = Unit.FromCentimeter(0.5);
-
-            var table = section.AddTable();
-            table.Borders.Width = 0.5;
-            table.Borders.Color = Colors.Gray;
-
-            // Determine number of columns from the first row
-            var firstRow = node.SelectSingleNode(".//tr");
-            if (firstRow == null) return;
-
-            // Note: use child axis ("./") here so we don't double-count nested cells
-            var firstRowCells = firstRow.SelectNodes("./th|./td");
-            if (firstRowCells == null || firstRowCells.Count == 0) return;
-            int columnCount = firstRowCells.Count;
-
-            // Dynamic widths
-            double[] columnWidths = CalculateColumnWidths(node, columnCount);
-            for (int i = 0; i < columnCount; i++)
-                table.AddColumn(Unit.FromCentimeter(columnWidths[i]));
-
-            // Rows
-            var rows = node.SelectNodes(".//tr");
-            if (rows == null) return;
-
-            bool isHeaderRow = true;
-            foreach (var rowNode in rows)
-            {
-                if (IsBlankRow(rowNode)) continue;
-
-                var row = table.AddRow();
-                var cellNodes = rowNode.SelectNodes("./th|./td");
-                if (cellNodes == null) continue;
-
-                for (int i = 0; i < cellNodes.Count && i < table.Columns.Count; i++)
-                {
-                    var cellNode = cellNodes[i];
-                    var cell = row.Cells[i];
-
-                    // Header styling (matches your previous logic)
-                    if (isHeaderRow || cellNode.Name.Equals("th", StringComparison.OrdinalIgnoreCase))
-                    {
-                        cell.Shading.Color = new Color(191, 191, 191);
-                        cell.Format.Font.Bold = true;
-                        cell.Format.SpaceBefore = Unit.FromPoint(6);
-                        cell.Format.SpaceAfter = Unit.FromPoint(6);
-                        cell.Format.LeftIndent = Unit.FromPoint(4);
-                        cell.Format.RightIndent = Unit.FromPoint(4);
-                    }
-                    else
-                    {
-                        cell.Format.SpaceBefore = Unit.FromPoint(4);
-                        cell.Format.SpaceAfter = Unit.FromPoint(4);
-                        cell.Format.LeftIndent = Unit.FromPoint(4);
-                        cell.Format.RightIndent = Unit.FromPoint(4);
-                    }
-
-                    // === Replicated content handling from AddTableToDocument ===
-                    var paragraph = cell.AddParagraph();
-                    if (isHeaderRow)
-                        paragraph.Format.Font.Bold = true;     // belt & suspenders
-
-                    foreach (var content in cellNode.ChildNodes)
-                    {
-                        if (content.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                        {
-                            // Fit image to current column width minus a small padding
-                            int colIndex = cell.Column.Index;
-                            Unit colWidth = cell.Table.Columns[colIndex].Width;
-                            AddImageToParagraph(paragraph, content, colWidth - Unit.FromCentimeter(0.2));
-                        }
-                        else if (content.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
-                        {
-                            foreach (var pContent in content.ChildNodes)
-                            {
-
-                                if (pContent.InnerText == "The hotel or site name.")
-                                {
-                                    var a = "";
-                                }
-
-                                if (pContent.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    try
-                                    {
-                                        int colIndex2 = cell.Column.Index;
-                                        Unit colWidth2 = cell.Table.Columns[colIndex2].Width;
-                                        AddImageToParagraph(paragraph, pContent, colWidth2 - Unit.FromCentimeter(0.2));
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        paragraph.AddText("[Image could not be loaded - ]" + ex.Message);
-                                        Debug.WriteLine($"Image load error: {ex.Message}");
-                                    }
-                                }
-                                else if (pContent.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) ||
-                                         pContent.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(pContent.InnerText));
-                                    ft.Bold = true;
-                                }
-                                else if (pContent.Name.Equals("em", StringComparison.OrdinalIgnoreCase) ||
-                                         pContent.Name.Equals("i", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(pContent.InnerText));
-                                    ft.Italic = true;
-                                }
-                                else if (pContent.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(pContent.InnerText));
-                                    ft.Underline = Underline.Single;
-                                }
-                                else if (pContent.NodeType == HtmlNodeType.Text)
-                                {
-                                    var text = pContent.InnerText;
-                                    if (!string.IsNullOrWhiteSpace(text))
-                                        paragraph.AddText(WebUtility.HtmlDecode(text));
-                                }
-                                else
-                                {
-                                    var text = pContent.InnerText;
-                                    if (!string.IsNullOrWhiteSpace(text))
-                                        paragraph.AddText(WebUtility.HtmlDecode(text));
-                                }
-                            }
-
-                            paragraph.Format.SpaceBefore = Unit.FromPoint(6);
-                            paragraph.Format.SpaceAfter = Unit.FromPoint(6);
-                        }
-                        else if (content.NodeType == HtmlNodeType.Text)
-                        {
-                            var text = content.InnerText;
-                            if (!string.IsNullOrWhiteSpace(text))
-                                paragraph.AddText(WebUtility.HtmlDecode(text));
-
-                            paragraph.Format.SpaceBefore = Unit.FromPoint(6);
-                            paragraph.Format.SpaceAfter = Unit.FromPoint(6);
-                        }
-                        else
-                        {
-                            var text = content.InnerText;
-                            if (!string.IsNullOrWhiteSpace(text))
-                                paragraph.AddText(WebUtility.HtmlDecode(text));
-
-                            paragraph.Format.SpaceBefore = Unit.FromPoint(6);
-                            paragraph.Format.SpaceAfter = Unit.FromPoint(6);
-                        }
-                    }
-                    // === end replicated content handling ===
-                }
-
-                isHeaderRow = false;
-            }
-        }
-
-
-        private void AddTable1(Section section, HtmlNode node)
-        {
-            if (node == null) return;
-
-            // Add page break before table header to ensure it starts on a fresh page
-            Paragraph pageBreak = section.AddParagraph();
-            pageBreak.Format.PageBreakBefore = true;
-            pageBreak.Format.SpaceBefore = Unit.FromCentimeter(0.5);
+            Paragraph paragraph = section.AddParagraph();
+            paragraph.Format.PageBreakBefore = true;
+            paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.5);
 
             Table table = section.AddTable();
             table.Borders.Width = 0.5;
             table.Borders.Color = Colors.Gray;
 
-            // Determine number of columns
-            var firstRow = node.SelectSingleNode(".//tr");
-            if (firstRow == null) return;
+            HtmlNode htmlNode = node.SelectSingleNode(".//tr");
+            if (htmlNode == null) return;
 
-            var cells = firstRow.SelectNodes(".//th|.//td");
-            if (cells == null || cells.Count == 0) return;
+            HtmlNodeCollection htmlNodeCollection = htmlNode.SelectNodes("./th|./td");
+            if (htmlNodeCollection == null || htmlNodeCollection.Count == 0) return;
 
-            // Calculate dynamic column widths based on content
-            var columnWidths = CalculateColumnWidths(node, cells.Count);
-            for (int i = 0; i < cells.Count; i++)
+            int count = htmlNodeCollection.Count;
+            double[] array = CalculateColumnWidths(node, count);
+            for (int i = 0; i < count; i++)
+                table.AddColumn(Unit.FromCentimeter(array[i]));
+
+            HtmlNodeCollection htmlNodeCollection2 = node.SelectNodes(".//tr");
+            if (htmlNodeCollection2 == null) return;
+
+            bool isFirstRow = true;
+            foreach (HtmlNode item in htmlNodeCollection2)
             {
-                table.AddColumn(Unit.FromCentimeter(columnWidths[i]));
-            }
-
-            // Process rows (keep existing structure)
-            var rows = node.SelectNodes(".//tr");
-            if (rows == null) return;
-
-            bool isHeader = true;
-            foreach (var rowNode in rows)
-            {
-                // Check if this is a blank row that should be skipped
-                bool isBlankRow = IsBlankRow(rowNode);
-                if (isBlankRow)
-                {
-                    continue; // Skip this row
-                }
+                if (IsBlankRow(item)) continue;
 
                 Row row = table.AddRow();
+                HtmlNodeCollection htmlNodeCollection3 = item.SelectNodes("./th|./td");
+                if (htmlNodeCollection3 == null) continue;
 
-                // Process cells (keep existing structure)
-                var cellNodes = rowNode.SelectNodes(".//th|.//td");
-                if (cellNodes == null) continue;
-
-                for (int i = 0; i < cellNodes.Count && i < table.Columns.Count; i++)
+                for (int j = 0; j < htmlNodeCollection3.Count && j < table.Columns.Count; j++)
                 {
-                    var cellNode = cellNodes[i];
-                    Cell cell = row.Cells[i];
+                    HtmlNode htmlNode2 = htmlNodeCollection3[j];
+                    Cell cell = row.Cells[j];
 
-                    // Apply header styling with standardized padding
-                    if (isHeader || cellNode.Name.ToLower() == "th")
+                    if (isFirstRow || htmlNode2.Name.Equals("th", StringComparison.OrdinalIgnoreCase))
                     {
-                        cell.Shading.Color = new Color(191, 191, 191);
+                        cell.Shading.Color = new MigraDoc.DocumentObjectModel.Color(191, 191, 191);
                         cell.Format.Font.Bold = true;
-                        // Header padding: 6pt top/bottom
-                        cell.Format.SpaceBefore = Unit.FromPoint(6);
-                        cell.Format.SpaceAfter = Unit.FromPoint(6);
-                        cell.Format.LeftIndent = Unit.FromPoint(4);
-                        cell.Format.RightIndent = Unit.FromPoint(4);
+                        cell.Format.SpaceBefore = Unit.FromPoint(6.0);
+                        cell.Format.SpaceAfter = Unit.FromPoint(6.0);
+                        cell.Format.LeftIndent = Unit.FromPoint(4.0);
+                        cell.Format.RightIndent = Unit.FromPoint(4.0);
                     }
                     else
                     {
-                        // Row padding: 4pt all sides
-                        cell.Format.SpaceBefore = Unit.FromPoint(4);
-                        cell.Format.SpaceAfter = Unit.FromPoint(4);
-                        cell.Format.LeftIndent = Unit.FromPoint(4);
-                        cell.Format.RightIndent = Unit.FromPoint(4);
+                        cell.Format.SpaceBefore = Unit.FromPoint(4.0);
+                        cell.Format.SpaceAfter = Unit.FromPoint(4.0);
+                        cell.Format.LeftIndent = Unit.FromPoint(4.0);
+                        cell.Format.RightIndent = Unit.FromPoint(4.0);
                     }
 
-                    // MODIFIED: Enhanced cell content processing
-                    ProcessTableCellContent(cell, cellNode);
-                }
+                    Paragraph paragraph2 = cell.AddParagraph();
+                    if (isFirstRow)
+                        paragraph2.Format.Font.Bold = true;
 
-                isHeader = false;
+                    foreach (HtmlNode item2 in htmlNode2.ChildNodes)
+                    {
+                        if (item2.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                        {
+                            int index = cell.Column.Index;
+                            Unit width = cell.Table.Columns[index].Width;
+                            AddImageToParagraph(paragraph2, item2, width - Unit.FromCentimeter(0.2));
+                        }
+                        else if (item2.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
+                        {
+                            foreach (HtmlNode item3 in item2.ChildNodes)
+                            {
+                                if (item3.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    try
+                                    {
+                                        int index2 = cell.Column.Index;
+                                        Unit width2 = cell.Table.Columns[index2].Width;
+                                        AddImageToParagraph(paragraph2, item3, width2 - Unit.FromCentimeter(0.2));
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        paragraph2.AddText("[Image could not be loaded - ]" + ex.Message);
+                                    }
+                                }
+                                else if (item3.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) || item3.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    FormattedText formattedText = paragraph2.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
+                                    formattedText.Bold = true;
+                                }
+                                else if (item3.Name.Equals("em", StringComparison.OrdinalIgnoreCase) || item3.Name.Equals("i", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    FormattedText formattedText2 = paragraph2.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
+                                    formattedText2.Italic = true;
+                                }
+                                else if (item3.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    FormattedText formattedText3 = paragraph2.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
+                                    formattedText3.Underline = Underline.Single;
+                                }
+                                else if (item3.NodeType == HtmlNodeType.Text)
+                                {
+                                    string innerText = item3.InnerText;
+                                    if (!string.IsNullOrWhiteSpace(innerText))
+                                        paragraph2.AddText(WebUtility.HtmlDecode(innerText));
+                                }
+                                else
+                                {
+                                    string innerText2 = item3.InnerText;
+                                    if (!string.IsNullOrWhiteSpace(innerText2))
+                                        paragraph2.AddText(WebUtility.HtmlDecode(innerText2));
+                                }
+                            }
+                            paragraph2.Format.SpaceBefore = Unit.FromPoint(6.0);
+                            paragraph2.Format.SpaceAfter = Unit.FromPoint(6.0);
+                        }
+                        else if (item2.NodeType == HtmlNodeType.Text)
+                        {
+                            string innerText3 = item2.InnerText;
+                            if (!string.IsNullOrWhiteSpace(innerText3))
+                                paragraph2.AddText(WebUtility.HtmlDecode(innerText3));
+                            paragraph2.Format.SpaceBefore = Unit.FromPoint(6.0);
+                            paragraph2.Format.SpaceAfter = Unit.FromPoint(6.0);
+                        }
+                        else
+                        {
+                            string innerText4 = item2.InnerText;
+                            if (!string.IsNullOrWhiteSpace(innerText4))
+                                paragraph2.AddText(WebUtility.HtmlDecode(innerText4));
+                            paragraph2.Format.SpaceBefore = Unit.FromPoint(6.0);
+                            paragraph2.Format.SpaceAfter = Unit.FromPoint(6.0);
+                        }
+                    }
+                }
+                isFirstRow = false;
             }
         }
 
-        // New helper method to handle table cell content
-        private void ProcessTableCellContent(Cell cell, HtmlNode cellNode)
+        // =========================================================================
+        // IMAGE HELPERS
+        // =========================================================================
+
+        private void AddImage(Section section, HtmlNode node)
         {
-            // Process each child node in the cell
-            foreach (var content in cellNode.ChildNodes)
+            string attributeValue = node.GetAttributeValue("src", "");
+            if (string.IsNullOrEmpty(attributeValue)) return;
+
+            try
             {
-                if (content.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                Paragraph paragraph = section.AddParagraph();
+                paragraph.Format.Alignment = ParagraphAlignment.Center;
+
+                if (attributeValue.StartsWith("http") || attributeValue.StartsWith("https"))
                 {
-                    string imageUrl = content.GetAttributeValue("src", "");
-                    if (!string.IsNullOrEmpty(imageUrl))
-                    {
-                        try
-                        {
-                            string cachedPath = DownloadImageCached(imageUrl);
-                            if (cachedPath == null)
-                            {
-                                var errorPara = cell.AddParagraph();
-                                errorPara.AddText("[Image could not be loaded]");
-                                continue;
-                            }
+                    // Change #5: Use image cache
+                    string localPath = DownloadImageCached(attributeValue);
+                    if (localPath == null) return;
 
-                            Paragraph imagePara = cell.AddParagraph();
-                            MigraDoc.DocumentObjectModel.Shapes.Image image = imagePara.AddImage(cachedPath);
-                            imagePara.Format.SpaceBefore = Unit.FromCentimeter(0.5);
-                            imagePara.Format.SpaceAfter = Unit.FromCentimeter(0.5);
-                            int colIndex = cell.Column.Index;
-                            Unit colWidth = cell.Table.Columns[colIndex].Width;
-                            Unit maxImageWidth = colWidth - Unit.FromCentimeter(0.2);
-
-                            string width = content.GetAttributeValue("width", "");
-                            string height = content.GetAttributeValue("height", "");
-
-                            bool sizeSet = false;
-
-                            if (!string.IsNullOrEmpty(width))
-                            {
-                                if (width.Equals("auto", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    image.LockAspectRatio = true;
-                                    image.Width = maxImageWidth;
-                                    sizeSet = true;
-                                }
-                                else if (int.TryParse(width.Replace("px", ""), out int pxWidth))
-                                {
-                                    image.Width = Unit.FromPoint(pxWidth * 0.75);
-                                    sizeSet = true;
-                                }
-                            }
-
-                            if (!string.IsNullOrEmpty(height))
-                            {
-                                if (height.Equals("auto", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    image.LockAspectRatio = true;
-                                }
-                                else if (int.TryParse(height.Replace("px", ""), out int pxHeight))
-                                {
-                                    image.Height = Unit.FromPoint(pxHeight * 0.75);
-                                }
-                            }
-
-                            if (!sizeSet)
-                            {
-                                image.LockAspectRatio = true;
-                                image.Width = maxImageWidth;
-                            }
-
-                            if (image.Width > maxImageWidth)
-                            {
-                                image.LockAspectRatio = true;
-                                image.Width = maxImageWidth;
-                            }
-
-                            imagePara.Format.Alignment = ParagraphAlignment.Center;
-                        }
-                        catch (Exception)
-                        {
-                            var errorPara = cell.AddParagraph();
-                            errorPara.AddText("[Image could not be loaded - ProcessTableCellContent]");
-                        }
-                    }
+                    Image image = paragraph.AddImage(localPath);
+                    image.LockAspectRatio = true;
+                    Section sec = paragraph.Section;
+                    Unit unit = sec.PageSetup.PageWidth - sec.PageSetup.LeftMargin - sec.PageSetup.RightMargin;
+                    Unit unit2 = Unit.FromCentimeter(15.0);
+                    if (unit2 > unit) unit2 = unit;
+                    image.Width = unit2;
+                    return;
                 }
-                else if (content.Name.Equals("figure", StringComparison.OrdinalIgnoreCase))
+
+                if (!attributeValue.StartsWith("~/")) return;
+
+                string text2 = HttpContext.Current.Server.MapPath(attributeValue);
+                if (File.Exists(text2))
                 {
-                    // Handle figure within table cell by using column width constraints
-                    var nestedImg = content.SelectSingleNode(".//img");
-                    if (nestedImg != null)
-                    {
-                        try
-                        {
-                            Paragraph imagePara = cell.AddParagraph();
-                            int colIndex = cell.Column.Index;
-                            Unit colWidth = cell.Table.Columns[colIndex].Width;
-                            Unit maxImageWidth = colWidth - Unit.FromCentimeter(0.2);
-                            AddImageToParagraph(imagePara, nestedImg, maxImageWidth);
-                        }
-                        catch (Exception)
-                        {
-                            var errorPara = cell.AddParagraph();
-                            errorPara.AddText("[Image could not be loaded - Figure]");
-                        }
-                    }
-                    // Optional caption
-                    var captionNode = content.SelectSingleNode(".//figcaption");
-                    if (captionNode != null && !string.IsNullOrWhiteSpace(captionNode.InnerText))
-                    {
-                        var captionPara = cell.AddParagraph();
-                        var ft = captionPara.AddFormattedText(WebUtility.HtmlDecode(captionNode.InnerText.Trim()));
-                        ft.Italic = true;
-                        captionPara.Format.Alignment = ParagraphAlignment.Center;
-                    }
-                }
-                else if (content.Name.Equals("video", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Video not supported in PDF; render a clickable link in the cell
-                    var videoUrl = content.GetAttributeValue("src", string.Empty);
-                    videoUrl = HttpUtility.HtmlDecode(videoUrl);
-                    videoUrl = CleanUrl(videoUrl);
-                    if (!string.IsNullOrEmpty(videoUrl))
-                    {
-                        var linkPara = cell.AddParagraph();
-                        var hyperlink = linkPara.AddHyperlink(videoUrl, HyperlinkType.Web);
-                        var linkText = hyperlink.AddFormattedText($"Video: {videoUrl}");
-                        linkText.Color = new Color(0, 106, 138);
-                        linkText.Underline = Underline.Single;
-                    }
-                }
-                else if (content.Name.Equals("strong", StringComparison.OrdinalIgnoreCase))
-                {
-                    var headingPara = cell.AddParagraph();
-
-                    headingPara.AddText(WebUtility.HtmlDecode(content.InnerText));
-                    headingPara.Format.Font.Bold = true;
-                    headingPara.Format.SpaceAfter = Unit.FromPoint(6);
-                    headingPara.Format.SpaceBefore = Unit.FromPoint(6);
-
-                }
-                else if (content.Name.Equals("h1", StringComparison.OrdinalIgnoreCase) ||
-                        content.Name.Equals("h2", StringComparison.OrdinalIgnoreCase) ||
-                        content.Name.Equals("h3", StringComparison.OrdinalIgnoreCase) ||
-                        content.Name.Equals("h4", StringComparison.OrdinalIgnoreCase) ||
-                        content.Name.Equals("h5", StringComparison.OrdinalIgnoreCase) ||
-                        content.Name.Equals("h6", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Handle headings in table cells
-                    var headingPara = cell.AddParagraph();
-
-                    // Process any text content directly in the heading
-                    var textNodes = content.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text);
-                    foreach (var textNode in textNodes)
-                    {
-                        if (!string.IsNullOrWhiteSpace(textNode.InnerText))
-                        {
-                            headingPara.AddText(WebUtility.HtmlDecode(textNode.InnerText.Trim()));
-                        }
-                    }
-
-                    // Process any span elements in the heading
-                    var spanNodes = content.SelectNodes(".//span");
-                    if (spanNodes != null)
-                    {
-                        foreach (var spanNode in spanNodes)
-                        {
-                            if (!string.IsNullOrWhiteSpace(spanNode.InnerText))
-                            {
-                                // Get color and font size from style attribute if present
-                                string style = spanNode.GetAttributeValue("style", "");
-                                string colorValue = ExtractStyleValue(style, "color");
-                                string fontSizeValue = ExtractStyleValue(style, "font-size");
-
-                                var textFormat = new MigraDoc.DocumentObjectModel.Font();
-
-                                // Apply color if specified
-                                if (!string.IsNullOrEmpty(colorValue))
-                                {
-                                    Color color = ParseColor(colorValue);
-                                    textFormat.Color = color;
-                                }
-
-                                // Apply font size if specified
-                                if (!string.IsNullOrEmpty(fontSizeValue))
-                                {
-                                    int fontSize = ParseFontSize(fontSizeValue);
-                                    if (fontSize > 0)
-                                    {
-                                        textFormat.Size = fontSize;
-                                    }
-                                }
-
-                                // Add the text with formatting
-                                FormattedText formattedText = headingPara.AddFormattedText(WebUtility.HtmlDecode(spanNode.InnerText.Trim()));
-                                if (!string.IsNullOrEmpty(colorValue))
-                                    formattedText.Font.Color = textFormat.Color;
-                                if (!string.IsNullOrEmpty(fontSizeValue) && textFormat.Size > 0)
-                                    formattedText.Font.Size = textFormat.Size;
-                            }
-                        }
-                    }
-
-                    // Apply heading styles based on level
-                    switch (content.Name.ToLower())
-                    {
-                        case "h1":
-                            headingPara.Format.Font.Size = 24;
-                            headingPara.Format.Font.Bold = true;
-                            headingPara.Format.Font.Color = new Color(28, 74, 113);
-                            headingPara.Format.SpaceBefore = Unit.FromPoint(10); // IS-003: 8pt before
-                            headingPara.Format.SpaceAfter = Unit.FromPoint(14);
-                            break;
-                        case "h2":
-                            headingPara.Format.Font.Size = 18;
-                            headingPara.Format.Font.Bold = true;
-                            headingPara.Format.Font.Color = Colors.Black;
-                            headingPara.Format.SpaceBefore = Unit.FromPoint(10); // IS-003: 8pt before
-                            headingPara.Format.SpaceAfter = Unit.FromPoint(8);  // IS-003: 6pt after
-                            break;
-                        case "h3":
-                            headingPara.Format.Font.Size = 16;
-                            headingPara.Format.Font.Bold = false;
-                            headingPara.Format.Font.Color = Colors.Black;
-                            headingPara.Format.SpaceBefore = Unit.FromPoint(14); // 14pt padding before subheadings
-                            headingPara.Format.SpaceAfter = Unit.FromPoint(8);   // 8pt after for clear separation  
-                            break;
-                        case "h4":
-                            headingPara.Format.Font.Size = 14;
-                            headingPara.Format.Font.Bold = false;
-                            headingPara.Format.Font.Color = Colors.Black;
-                            headingPara.Format.SpaceBefore = Unit.FromPoint(12);    
-                            headingPara.Format.SpaceAfter = Unit.FromPoint(8);  // 8pt after for clear separation  
-                            break;
-                        default:
-                            headingPara.Format.Font.Size = 12;
-                            headingPara.Format.Font.Bold = false;
-                            headingPara.Format.Font.Color = Colors.Black;
-                            headingPara.Format.SpaceBefore = Unit.FromPoint(6);
-                            headingPara.Format.SpaceAfter = Unit.FromPoint(6);
-                            break;
-                    }
-
-                    // Ensure heading in table cells is not orphaned at page bottom
-                    headingPara.Format.KeepWithNext = true;
-                    headingPara.Format.KeepTogether = true;
-
-                    // Process any nested lists in the heading
-                    var ulNodes = content.SelectNodes(".//ul");
-                    if (ulNodes != null)
-                    {
-                        foreach (var ulNode in ulNodes)
-                        {
-                            // Process each list item
-                            var liNodes = ulNode.SelectNodes("./li"); // Direct children only
-                            if (liNodes != null)
-                            {
-                                foreach (var liNode in liNodes)
-                                {
-                                    var listItemPara = cell.AddParagraph();
-                                    //listItemPara.Format.LeftIndent = Unit.FromCentimeter(0.02);
-                                    //listItemPara.Format.FirstLineIndent = Unit.FromCentimeter(-0.02);
-                                    listItemPara.AddText("• ");
-
-                                    // Process text content in list item
-                                    var liTextNodes = liNode.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text);
-                                    foreach (var liTextNode in liTextNodes)
-                                    {
-                                        if (!string.IsNullOrWhiteSpace(liTextNode.InnerText))
-                                        {
-                                            listItemPara.AddText(WebUtility.HtmlDecode(liTextNode.InnerText.Trim()));
-                                        }
-                                    }
-
-                                    // Process span elements in list item
-                                    var liSpanNodes = liNode.SelectNodes("./span");
-                                    if (liSpanNodes != null)
-                                    {
-                                        foreach (var liSpanNode in liSpanNodes)
-                                        {
-                                            if (!string.IsNullOrWhiteSpace(liSpanNode.InnerText))
-                                            {
-                                                string style = liSpanNode.GetAttributeValue("style", "");
-                                                string colorValue = ExtractStyleValue(style, "color");
-                                                string fontSizeValue = ExtractStyleValue(style, "font-size");
-
-                                                FormattedText formattedText = listItemPara.AddFormattedText(WebUtility.HtmlDecode(liSpanNode.InnerText.Trim()));
-
-                                                if (!string.IsNullOrEmpty(colorValue))
-                                                    formattedText.Font.Color = ParseColor(colorValue);
-
-                                                if (!string.IsNullOrEmpty(fontSizeValue))
-                                                {
-                                                    int fontSize = ParseFontSize(fontSizeValue);
-                                                    if (fontSize > 0)
-                                                        formattedText.Font.Size = fontSize;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    listItemPara.Format.SpaceBefore = Unit.FromPoint(6);
-                                    listItemPara.Format.SpaceAfter = Unit.FromPoint(6);
-                                }
-                            }
-                        }
-                    }
-                }
-                else if (content.Name.Equals("ul", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Process list items directly in table cell
-                    var liNodes = content.SelectNodes("./li"); // Direct children only
-                    if (liNodes != null)
-                    {
-                        foreach (var liNode in liNodes)
-                        {
-                            var listItemPara = cell.AddParagraph();
-                            listItemPara.Format.LeftIndent = Unit.FromCentimeter(0.2);
-                            listItemPara.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
-
-                            // Check if the list item has paragraph children
-                            var pNodes = liNode.SelectNodes("./p");
-                            if (pNodes != null && pNodes.Count > 0)
-                            {
-                                // Process paragraphs within list item
-                                foreach (var pNode in pNodes)
-                                {
-                                    // Add bullet point to the first paragraph only
-                                    if (pNode == pNodes[0])
-                                    {
-                                        listItemPara.AddText("• ");
-                                        listItemPara.AddText(WebUtility.HtmlDecode(pNode.InnerText.Trim()));
-                                    }
-                                    else
-                                    {
-                                        var additionalPara = cell.AddParagraph();
-                                        additionalPara.Format.LeftIndent = Unit.FromCentimeter(1.0);
-                                        additionalPara.AddText(WebUtility.HtmlDecode(pNode.InnerText.Trim()));
-                                        additionalPara.Format.SpaceAfter = Unit.FromPoint(3);
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                // Process text content in list item
-                                var liTextNodes = liNode.ChildNodes.Where(n => n.NodeType == HtmlNodeType.Text);
-                                foreach (var liTextNode in liTextNodes)
-                                {
-                                    if (!string.IsNullOrWhiteSpace(liTextNode.InnerText))
-                                    {
-                                        listItemPara.AddText("• ");
-                                        listItemPara.AddText(WebUtility.HtmlDecode(liTextNode.InnerText.Trim()));
-                                    }
-                                }
-
-                                // Process span elements in list item
-                                var liSpanNodes = liNode.SelectNodes(".//span");
-                                if (liSpanNodes != null)
-                                {
-                                    foreach (var liSpanNode in liSpanNodes)
-                                    {
-                                        if (!string.IsNullOrWhiteSpace(liSpanNode.InnerText))
-                                        {
-                                            string style = liSpanNode.GetAttributeValue("style", "");
-                                            string colorValue = ExtractStyleValue(style, "color");
-                                            string fontSizeValue = ExtractStyleValue(style, "font-size");
-
-                                            FormattedText formattedText = listItemPara.AddFormattedText(WebUtility.HtmlDecode(liSpanNode.InnerText.Trim()));
-
-                                            if (!string.IsNullOrEmpty(colorValue))
-                                                formattedText.Font.Color = ParseColor(colorValue);
-
-                                            if (!string.IsNullOrEmpty(fontSizeValue))
-                                            {
-                                                int fontSize = ParseFontSize(fontSizeValue);
-                                                if (fontSize > 0)
-                                                    formattedText.Font.Size = fontSize;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            listItemPara.Format.SpaceBefore = Unit.FromPoint(6);
-                            listItemPara.Format.SpaceAfter = Unit.FromPoint(6);
-                        }
-                    }
-                }
-                else if (content.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Handle paragraphs in table cells with inline formatting support
-                    var paragraph = cell.AddParagraph();
-                    paragraph.Format.KeepTogether = true;
-
-                    // If the paragraph contains an image, handle that first and skip inline text
-                    var imgNode = content.SelectSingleNode(".//img");
-                    if (imgNode != null)
-                    {
-                        string imageUrl = imgNode.GetAttributeValue("src", "");
-                        if (!string.IsNullOrEmpty(imageUrl))
-                        {
-                            try
-                            {
-                                string cachedPath = DownloadImageCached(imageUrl);
-                                if (cachedPath != null)
-                                {
-                                    var image = paragraph.AddImage(cachedPath);
-
-                                    int colIndex = cell.Column.Index;
-                                    if (colIndex >= 0 && colIndex < cell.Table.Columns.Count)
-                                    {
-                                        image.Width = Unit.FromCentimeter(cell.Table.Columns[colIndex].Width.Centimeter - 0.5);
-                                    }
-                                    else
-                                    {
-                                        image.Width = Unit.FromCentimeter(5);
-                                    }
-                                    image.LockAspectRatio = true;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                paragraph.AddText(ex.Message);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Render inline child nodes recursively to support nested tags and styles
-                        AddInlineParagraphContent(paragraph, content, false, false, false, null, null);
-                    }
-
-                    paragraph.Format.SpaceBefore = Unit.FromPoint(6);
-                    paragraph.Format.SpaceAfter = Unit.FromPoint(6);
-                }
-                else if (content.NodeType == HtmlNodeType.Text && !string.IsNullOrWhiteSpace(content.InnerText))
-                {
-                    // Handle plain text nodes
-                    var paragraph = cell.AddParagraph();
-                    paragraph.AddText(WebUtility.HtmlDecode(content.InnerText.Trim()));
-                    paragraph.Format.SpaceAfter = Unit.FromPoint(0.3);
-                    paragraph.Format.SpaceBefore = Unit.FromPoint(0.3);
+                    Image image2 = paragraph.AddImage(text2);
+                    image2.LockAspectRatio = true;
+                    Section sec2 = paragraph.Section;
+                    Unit unit3 = sec2.PageSetup.PageWidth - sec2.PageSetup.LeftMargin - sec2.PageSetup.RightMargin;
+                    Unit unit4 = Unit.FromCentimeter(15.0);
+                    if (unit4 > unit3) unit4 = unit3;
+                    image2.Width = unit4;
                 }
             }
-        }
-
-        // Helper to clean media URLs (remove stray backticks/spaces)
-        private string CleanUrl(string url)
-        {
-            if (string.IsNullOrWhiteSpace(url)) return url;
-            var cleaned = url.Trim().Trim('`').Trim('"');
-            // Replace spaces with %20 to ensure valid URLs
-            if (cleaned.IndexOf(' ') >= 0)
+            catch (Exception ex)
             {
-                cleaned = cleaned.Replace(" ", "%20");
+                Console.WriteLine("Error adding image " + attributeValue + ": " + ex.Message);
             }
-            return cleaned.Trim();
         }
 
         private void AddHorizontalLine(Section section)
         {
-            Paragraph para = section.AddParagraph();
-            para.Format.Borders.Bottom.Width = 0.5;
-            para.Format.Borders.Bottom.Color = new Color(28, 74, 113); // Nomadix blue color
-            para.Format.SpaceBefore = Unit.FromCentimeter(0.3);
-            para.Format.SpaceAfter = Unit.FromCentimeter(0.3);
+            Paragraph paragraph = section.AddParagraph();
+            paragraph.Format.Borders.Bottom.Width = 0.5;
+            paragraph.Format.Borders.Bottom.Color = new MigraDoc.DocumentObjectModel.Color(28, 74, 113);
+            paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.3);
+            paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.3);
         }
 
-        // Recursively render inline content with inherited styles (bold/italic/underline/color/size)
-        private void AddInlineParagraphContent(Paragraph paragraph, HtmlNode node,
-            bool parentBold, bool parentItalic, bool parentUnderline,
-            Color? parentColor, int? parentFontSize)
+        private void AddInlineParagraphContent(Paragraph paragraph, HtmlNode node, bool parentBold, bool parentItalic, bool parentUnderline, Color? parentColor, int? parentFontSize)
         {
-            bool isBold = parentBold;
-            bool isItalic = parentItalic;
-            bool isUnderline = parentUnderline;
-            Color? color = parentColor;
-            int? fontSize = parentFontSize;
+            bool flag = parentBold;
+            bool flag2 = parentItalic;
+            bool flag3 = parentUnderline;
+            Color? parentColor2 = parentColor;
+            int? parentFontSize2 = parentFontSize;
 
-            // Apply tag-based style inheritance
-            string nodeName = node.Name?.ToLower() ?? string.Empty;
-            if (nodeName == "strong" || nodeName == "b") isBold = true;
-            if (nodeName == "em" || nodeName == "i") isItalic = true;
-            if (nodeName == "u") isUnderline = true;
+            string text = node.Name?.ToLower() ?? string.Empty;
+            if (text == "strong" || text == "b") flag = true;
+            if (text == "em" || text == "i") flag2 = true;
+            if (text == "u") flag3 = true;
 
-            // Apply inline style attributes if present (e.g., span styles)
-            string style = node.GetAttributeValue("style", "");
-            if (!string.IsNullOrEmpty(style))
+            string attributeValue = node.GetAttributeValue("style", "");
+            if (!string.IsNullOrEmpty(attributeValue))
             {
-                string colorValue = ExtractStyleValue(style, "color");
-                if (!string.IsNullOrEmpty(colorValue))
+                string text2 = ExtractStyleValue(attributeValue, "color");
+                if (!string.IsNullOrEmpty(text2)) parentColor2 = ParseColor(text2);
+
+                string text3 = ExtractStyleValue(attributeValue, "font-size");
+                if (!string.IsNullOrEmpty(text3))
                 {
-                    color = ParseColor(colorValue);
+                    int num = ParseFontSize(text3);
+                    if (num > 0) parentFontSize2 = num;
                 }
 
-                string fontSizeValue = ExtractStyleValue(style, "font-size");
-                if (!string.IsNullOrEmpty(fontSizeValue))
+                string text4 = ExtractStyleValue(attributeValue, "font-weight");
+                if (!string.IsNullOrEmpty(text4))
                 {
-                    int sz = ParseFontSize(fontSizeValue);
-                    if (sz > 0) fontSize = sz;
+                    int result;
+                    if (text4.Equals("bold", StringComparison.OrdinalIgnoreCase) || text4.Equals("bolder", StringComparison.OrdinalIgnoreCase))
+                        flag = true;
+                    else if (int.TryParse(text4, out result) && result >= 600)
+                        flag = true;
                 }
 
-                string fontWeightValue = ExtractStyleValue(style, "font-weight");
-                if (!string.IsNullOrEmpty(fontWeightValue))
-                {
-                    // Treat bold, bolder, or numeric weights >= 600 as bold
-                    if (fontWeightValue.Equals("bold", StringComparison.OrdinalIgnoreCase) ||
-                        fontWeightValue.Equals("bolder", StringComparison.OrdinalIgnoreCase))
-                    {
-                        isBold = true;
-                    }
-                    else if (int.TryParse(fontWeightValue, out int fw) && fw >= 600)
-                    {
-                        isBold = true;
-                    }
-                }
+                string text5 = ExtractStyleValue(attributeValue, "text-decoration");
+                if (!string.IsNullOrEmpty(text5) && text5.IndexOf("underline", StringComparison.OrdinalIgnoreCase) >= 0)
+                    flag3 = true;
 
-                string textDecorationValue = ExtractStyleValue(style, "text-decoration");
-                if (!string.IsNullOrEmpty(textDecorationValue) &&
-                    textDecorationValue.IndexOf("underline", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    isUnderline = true;
-                }
-                string fontStyleValue = ExtractStyleValue(style, "font-style");
-                if (!string.IsNullOrEmpty(fontStyleValue) &&
-                    fontStyleValue.Equals("italic", StringComparison.OrdinalIgnoreCase))
-                {
-                    isItalic = true;
-                }
+                string text6 = ExtractStyleValue(attributeValue, "font-style");
+                if (!string.IsNullOrEmpty(text6) && text6.Equals("italic", StringComparison.OrdinalIgnoreCase))
+                    flag2 = true;
             }
 
-            foreach (var child in node.ChildNodes)
+            foreach (HtmlNode item in node.ChildNodes)
             {
-                if (child.NodeType == HtmlNodeType.Text)
+                if (item.NodeType == HtmlNodeType.Text)
                 {
-                    string text = child.InnerText;
-                    if (!string.IsNullOrWhiteSpace(text))
+                    string innerText = item.InnerText;
+                    if (!string.IsNullOrWhiteSpace(innerText))
                     {
-                        var ft = paragraph.AddFormattedText(WebUtility.HtmlDecode(text));
-                        if (isBold) ft.Bold = true;
-                        if (isItalic) ft.Italic = true;
-                        if (isUnderline) ft.Underline = Underline.Single;
-                        if (color.HasValue) ft.Font.Color = color.Value;
-                        if (fontSize.HasValue && fontSize.Value > 0) ft.Font.Size = fontSize.Value;
+                        FormattedText formattedText = paragraph.AddFormattedText(WebUtility.HtmlDecode(innerText));
+                        if (flag) formattedText.Bold = true;
+                        if (flag2) formattedText.Italic = true;
+                        if (flag3) formattedText.Underline = Underline.Single;
+                        if (parentColor2.HasValue) formattedText.Font.Color = parentColor2.Value;
+                        if (parentFontSize2.HasValue && parentFontSize2.Value > 0) formattedText.Font.Size = parentFontSize2.Value;
                     }
                 }
-                else if (child.Name.Equals("br", StringComparison.OrdinalIgnoreCase))
+                else if (item.Name.Equals("br", StringComparison.OrdinalIgnoreCase))
                 {
                     paragraph.AddLineBreak();
                 }
                 else
                 {
-                    // Recurse into nested inline elements to carry accumulated styles
-                    AddInlineParagraphContent(paragraph, child, isBold, isItalic, isUnderline, color, fontSize);
+                    AddInlineParagraphContent(paragraph, item, flag, flag2, flag3, parentColor2, parentFontSize2);
                 }
             }
         }
 
-        private void AddImage(Section section, HtmlNode node)
+        // =========================================================================
+        // UTILITY METHODS
+        // =========================================================================
+
+        private string CleanUrl(string url)
         {
-            string src = node.GetAttributeValue("src", "");
-            if (string.IsNullOrEmpty(src)) return;
-
-            try
-            {
-                Paragraph para = section.AddParagraph();
-                para.Format.Alignment = ParagraphAlignment.Center;
-
-                if (src.StartsWith("http") || src.StartsWith("https"))
-                {
-                    string cachedPath = DownloadImageCached(src);
-                    if (cachedPath == null) return;
-
-                    var image = para.AddImage(cachedPath);
-                    image.LockAspectRatio = true;
-
-                    section = para.Section;
-                    Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
-
-                    Unit targetWidth = Unit.FromCentimeter(15);
-                    if (targetWidth > containerWidth)
-                        targetWidth = containerWidth;
-                    image.Width = targetWidth;
-                }
-                else if (src.StartsWith("~/"))
-                {
-                    string localPath = HttpContext.Current.Server.MapPath(src);
-                    if (File.Exists(localPath))
-                    {
-                        var image = para.AddImage(localPath);
-                        image.LockAspectRatio = true;
-
-                        section = para.Section;
-                        Unit containerWidth = section.PageSetup.PageWidth - section.PageSetup.LeftMargin - section.PageSetup.RightMargin;
-
-                        Unit targetWidth = Unit.FromCentimeter(15);
-                        if (targetWidth > containerWidth)
-                            targetWidth = containerWidth;
-                        image.Width = targetWidth;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error adding image {src}: {ex.Message}");
-            }
+            if (string.IsNullOrWhiteSpace(url)) return url;
+            string text = url.Trim().Trim('`').Trim('"');
+            if (text.IndexOf(' ') >= 0)
+                text = text.Replace(" ", "%20");
+            return text.Trim();
         }
 
         private string StripHtml(string html)
         {
             if (string.IsNullOrEmpty(html)) return string.Empty;
-
-            // Simple HTML tag removal
-            return System.Text.RegularExpressions.Regex.Replace(html, "<.*?>", string.Empty);
+            return Regex.Replace(html, "<.*?>", string.Empty);
         }
 
-        // Helper method to extract style values from style attribute
         private string ExtractStyleValue(string style, string property)
         {
-            if (string.IsNullOrEmpty(style))
-                return string.Empty;
-
-            // Create regex pattern to match the property and its value
+            if (string.IsNullOrEmpty(style)) return string.Empty;
             string pattern = property + "\\s*:\\s*([^;]+)";
-            var match = System.Text.RegularExpressions.Regex.Match(style, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
+            Match match = Regex.Match(style, pattern, RegexOptions.IgnoreCase);
             if (match.Success && match.Groups.Count > 1)
                 return match.Groups[1].Value.Trim();
-
             return string.Empty;
         }
 
-        // Helper method to parse color values from CSS color formats
         private Color ParseColor(string colorValue)
         {
-            if (string.IsNullOrEmpty(colorValue))
-                return Colors.Black;
+            if (string.IsNullOrEmpty(colorValue)) return Colors.Black;
 
-            // Handle rgb() format
             if (colorValue.StartsWith("rgb("))
             {
-                // Extract the RGB values
-                string rgbValues = colorValue.Substring(4, colorValue.Length - 5);
-                string[] values = rgbValues.Split(',');
-
-                if (values.Length >= 3)
+                string text = colorValue.Substring(4, colorValue.Length - 5);
+                string[] array = text.Split(',');
+                if (array.Length >= 3)
                 {
-                    int r = int.Parse(values[0].Trim());
-                    int g = int.Parse(values[1].Trim());
-                    int b = int.Parse(values[2].Trim());
-
-                    // Cast to byte to match Color constructor parameter type
-                    return new Color((byte)Math.Min(r, 255), (byte)Math.Min(g, 255), (byte)Math.Min(b, 255));
+                    int val = int.Parse(array[0].Trim());
+                    int val2 = int.Parse(array[1].Trim());
+                    int val3 = int.Parse(array[2].Trim());
+                    return new MigraDoc.DocumentObjectModel.Color((byte)Math.Min(val, 255), (byte)Math.Min(val2, 255), (byte)Math.Min(val3, 255));
                 }
             }
-            // Handle hex format
             else if (colorValue.StartsWith("#"))
             {
-                string hex = colorValue.Substring(1);
-                if (hex.Length == 3) // Short hex format #RGB
+                string text2 = colorValue.Substring(1);
+                if (text2.Length == 3)
                 {
-                    hex = new string(new char[] { hex[0], hex[0], hex[1], hex[1], hex[2], hex[2] });
+                    text2 = new string(new char[6] { text2[0], text2[0], text2[1], text2[1], text2[2], text2[2] });
                 }
-
-                if (hex.Length == 6)
+                if (text2.Length == 6)
                 {
-                    int r = Convert.ToInt32(hex.Substring(0, 2), 16);
-                    int g = Convert.ToInt32(hex.Substring(2, 2), 16);
-                    int b = Convert.ToInt32(hex.Substring(4, 2), 16);
-
-                    // Cast to byte to match Color constructor parameter type
-                    return new Color((byte)Math.Min(r, 255), (byte)Math.Min(g, 255), (byte)Math.Min(b, 255));
+                    int val4 = Convert.ToInt32(text2.Substring(0, 2), 16);
+                    int val5 = Convert.ToInt32(text2.Substring(2, 2), 16);
+                    int val6 = Convert.ToInt32(text2.Substring(4, 2), 16);
+                    return new MigraDoc.DocumentObjectModel.Color((byte)Math.Min(val4, 255), (byte)Math.Min(val5, 255), (byte)Math.Min(val6, 255));
                 }
             }
-            // Handle named colors
             else
             {
                 switch (colorValue.ToLower())
@@ -3667,203 +2154,572 @@ namespace PickupAPi.Controllers
                     case "orange": return Colors.Orange;
                     case "purple": return Colors.Purple;
                     case "brown": return Colors.Brown;
-                        // Add more named colors as needed
                 }
             }
-
-            // Default to black if color parsing fails
             return Colors.Black;
         }
 
-        // Helper method to parse font size values
         private int ParseFontSize(string fontSizeValue)
         {
-            if (string.IsNullOrEmpty(fontSizeValue))
-                return 0;
+            if (string.IsNullOrEmpty(fontSizeValue)) return 0;
 
-            // Handle pixel values
             if (fontSizeValue.EndsWith("px"))
             {
-                if (int.TryParse(fontSizeValue.Replace("px", "").Trim(), out int pxSize))
-                {
-                    // Convert pixels to points (approximate conversion)
-                    return pxSize * 3 / 4;
-                }
+                int result;
+                if (int.TryParse(fontSizeValue.Replace("px", "").Trim(), out result))
+                    return result * 3 / 4;
             }
-            // Handle point values
             else if (fontSizeValue.EndsWith("pt"))
             {
-                if (int.TryParse(fontSizeValue.Replace("pt", "").Trim(), out int ptSize))
-                {
-                    return ptSize;
-                }
+                int result2;
+                if (int.TryParse(fontSizeValue.Replace("pt", "").Trim(), out result2))
+                    return result2;
             }
-            // Handle em values (relative to parent)
             else if (fontSizeValue.EndsWith("em"))
             {
-                if (double.TryParse(fontSizeValue.Replace("em", "").Trim(), out double emSize))
-                {
-                    // Assuming base font size is 12pt
-                    return (int)(12 * emSize);
-                }
+                double result3;
+                if (double.TryParse(fontSizeValue.Replace("em", "").Trim(), out result3))
+                    return (int)(12.0 * result3);
             }
-            // Handle direct numeric values
-            else if (int.TryParse(fontSizeValue.Trim(), out int directSize))
+            else
             {
-                return directSize;
+                int result4;
+                if (int.TryParse(fontSizeValue.Trim(), out result4))
+                    return result4;
             }
             return 0;
         }
 
-        // Helper method to check if a table row is blank and should be skipped
         private bool IsBlankRow(HtmlNode rowNode)
         {
             if (rowNode == null) return true;
 
-            // Get all cells in the row
-            var cellNodes = rowNode.SelectNodes("./td|./th");
-            if (cellNodes == null || cellNodes.Count == 0) return true;
+            HtmlNodeCollection htmlNodeCollection = rowNode.SelectNodes("./td|./th");
+            if (htmlNodeCollection == null || htmlNodeCollection.Count == 0) return true;
 
-            // Check each cell to see if it's empty or contains only empty elements
-            foreach (var cellNode in cellNodes)
+            foreach (HtmlNode item in htmlNodeCollection)
             {
-                // Check for horizontal rule (hr) which indicates a divider row
-                var hrNodes = cellNode.SelectNodes(".//hr");
+                HtmlNodeCollection hrNodes = item.SelectNodes(".//hr");
                 if (hrNodes != null && hrNodes.Count > 0)
                 {
-                    // Check if there's only an hr and possibly an empty paragraph
-                    var paragraphs = cellNode.SelectNodes(".//p");
-                    if (paragraphs != null)
+                    HtmlNodeCollection pNodes = item.SelectNodes(".//p");
+                    if (pNodes == null) return true;
+                    bool flag = true;
+                    foreach (HtmlNode item2 in pNodes)
                     {
-                        bool allEmpty = true;
-                        foreach (var p in paragraphs)
+                        if (!string.IsNullOrWhiteSpace(item2.InnerText) || item2.SelectNodes(".//img") != null)
                         {
-                            // Check if paragraph has any content
-                            if (!string.IsNullOrWhiteSpace(p.InnerText) || p.SelectNodes(".//img") != null)
+                            flag = false;
+                            break;
+                        }
+                    }
+                    if (flag) return true;
+                }
+
+                if (!string.IsNullOrWhiteSpace(item.InnerText)) return false;
+                if (item.SelectNodes(".//img") != null || item.SelectNodes(".//table") != null ||
+                    item.SelectNodes(".//ul") != null || item.SelectNodes(".//ol") != null)
+                    return false;
+            }
+            return true;
+        }
+
+        private double[] CalculateColumnWidths(HtmlNode tableNode, int columnCount)
+        {
+            double[] array = new double[columnCount];
+            int[] array2 = new int[columnCount];
+            double num = 16.0;
+
+            HtmlNodeCollection htmlNodeCollection = tableNode.SelectNodes(".//tr");
+            if (htmlNodeCollection != null)
+            {
+                foreach (HtmlNode item in htmlNodeCollection)
+                {
+                    HtmlNodeCollection htmlNodeCollection2 = item.SelectNodes(".//th|.//td");
+                    if (htmlNodeCollection2 != null)
+                    {
+                        for (int i = 0; i < htmlNodeCollection2.Count && i < columnCount; i++)
+                        {
+                            string value = htmlNodeCollection2[i].InnerText?.Trim() ?? "";
+                            value = WebUtility.HtmlDecode(value);
+                            array2[i] = Math.Max(array2[i], value.Length);
+                        }
+                    }
+                }
+            }
+
+            int num2 = array2.Sum();
+            if (num2 == 0)
+            {
+                double num3 = num / (double)columnCount;
+                for (int j = 0; j < columnCount; j++)
+                    array[j] = num3;
+            }
+            else
+            {
+                double val = 2.0;
+                double val2 = num * 0.6;
+                for (int k = 0; k < columnCount; k++)
+                {
+                    double val3 = (double)array2[k] / (double)num2 * num;
+                    array[k] = Math.Max(val, Math.Min(val2, val3));
+                }
+                double num4 = array.Sum();
+                if (num4 > num)
+                {
+                    double num5 = num / num4;
+                    for (int l = 0; l < columnCount; l++)
+                        array[l] *= num5;
+                }
+                else if (num4 < num)
+                {
+                    double num6 = num - num4;
+                    double num7 = num6 / (double)columnCount;
+                    for (int m = 0; m < columnCount; m++)
+                        array[m] += num7;
+                }
+            }
+            return array;
+        }
+
+        // =========================================================================
+        // DOCUMENT360 API HELPERS
+        // =========================================================================
+
+        private async Task<string> GetArticleByUrl(string articleUrl)
+        {
+            HttpClient val = new HttpClient();
+            val.DefaultRequestHeaders.Add("api_token", API_TOKEN);
+            string text = "https://apihub.document360.io/v2/Articles?url=" + HttpUtility.UrlEncode(articleUrl) + "&isPublished=true";
+            HttpResponseMessage val2 = await val.GetAsync(text);
+            val2.EnsureSuccessStatusCode();
+            return await val2.Content.ReadAsStringAsync();
+        }
+
+        private async Task<string> GetCategoryArticles(string categoryId)
+        {
+            HttpClient val = new HttpClient();
+            val.DefaultRequestHeaders.Add("api_token", API_TOKEN);
+            string text = "https://apihub.document360.io/v2/Categories/" + categoryId;
+            HttpResponseMessage val2 = await val.GetAsync(text);
+            val2.EnsureSuccessStatusCode();
+            return await val2.Content.ReadAsStringAsync();
+        }
+
+        private async Task<string> GetArticleDetail(string articleId)
+        {
+            HttpClient val = new HttpClient();
+            val.DefaultRequestHeaders.Add("api_token", API_TOKEN);
+            string text = "https://apihub.document360.io/v2/Articles/" + articleId + "/en?isForDisplay=true";
+            HttpResponseMessage val2 = await val.GetAsync(text);
+            val2.EnsureSuccessStatusCode();
+            return await val2.Content.ReadAsStringAsync();
+        }
+
+        private List<string> ExtractArticleIds(dynamic categoryData)
+        {
+            List<string> list = new List<string>();
+            if (categoryData.articles != null)
+            {
+                foreach (dynamic item in categoryData.articles)
+                    list.Add((string)item.id);
+            }
+            if (categoryData.child_categories != null)
+            {
+                foreach (dynamic item2 in categoryData.child_categories)
+                    list.AddRange(ExtractArticleIds(item2));
+            }
+            return list;
+        }
+
+        private void RenderHtmlTable(Section section, HtmlNode tableNode, Color textColor)
+        {
+            Table table = section.AddTable();
+            table.Borders.Width = 0.5;
+            table.Borders.Color = Colors.Gray;
+
+            int valueOrDefault = (tableNode.SelectSingleNode(".//tr")?.SelectNodes("./th|./td")?.Count).GetValueOrDefault(1);
+            for (int i = 0; i < valueOrDefault; i++)
+                table.AddColumn(Unit.FromCentimeter(16.0 / (double)valueOrDefault));
+
+            foreach (HtmlNode item in tableNode.SelectNodes(".//tr"))
+            {
+                Row row = table.AddRow();
+                int num = 0;
+                foreach (HtmlNode item2 in item.SelectNodes("./th|./td"))
+                {
+                    Cell cell = row.Cells[num];
+                    Paragraph paragraph = cell.AddParagraph();
+                    paragraph.Format.Font.Color = textColor;
+                    string text = WebUtility.HtmlDecode(item2.InnerText.Trim());
+                    if (!string.IsNullOrEmpty(text))
+                        paragraph.AddText(text);
+                    HtmlNode htmlNode = item2.SelectSingleNode(".//img");
+                    if (htmlNode != null)
+                    {
+                        string text2 = HttpUtility.HtmlDecode(htmlNode.GetAttributeValue("src", ""));
+                        if (!string.IsNullOrEmpty(text2))
+                            AddImageToParaSection(text2, section);
+                    }
+                    num++;
+                }
+            }
+        }
+
+        private void ProcessTableCellContent(Cell cell, HtmlNode cellNode)
+        {
+            foreach (HtmlNode item in cellNode.ChildNodes)
+            {
+                if (item.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                {
+                    string attributeValue = item.GetAttributeValue("src", "");
+                    if (string.IsNullOrEmpty(attributeValue)) continue;
+                    try
+                    {
+                        string url = HttpUtility.HtmlDecode(attributeValue);
+                        url = CleanUrl(url);
+
+                        // Change #5: Use image cache
+                        string localPath = DownloadImageCached(url);
+                        if (localPath == null) continue;
+
+                        Paragraph paragraph = cell.AddParagraph();
+                        Image image = paragraph.AddImage(localPath);
+                        paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.5);
+                        paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.5);
+                        int index = cell.Column.Index;
+                        Unit width = cell.Table.Columns[index].Width;
+                        Unit unit = width - Unit.FromCentimeter(0.2);
+
+                        string attributeValue2 = item.GetAttributeValue("width", "");
+                        string attributeValue3 = item.GetAttributeValue("height", "");
+                        bool flag = false;
+                        if (!string.IsNullOrEmpty(attributeValue2))
+                        {
+                            int result;
+                            if (attributeValue2.Equals("auto", StringComparison.OrdinalIgnoreCase))
                             {
-                                allEmpty = false;
-                                break;
+                                image.LockAspectRatio = true;
+                                image.Width = unit;
+                                flag = true;
+                            }
+                            else if (int.TryParse(attributeValue2.Replace("px", ""), out result))
+                            {
+                                image.Width = Unit.FromPoint((double)result * 0.75);
+                                flag = true;
                             }
                         }
-
-                        if (allEmpty)
+                        if (!string.IsNullOrEmpty(attributeValue3))
                         {
-                            // This is a row with just an hr and empty paragraphs - skip it
-                            return true;
+                            int result2;
+                            if (attributeValue3.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                            {
+                                image.LockAspectRatio = true;
+                            }
+                            else if (int.TryParse(attributeValue3.Replace("px", ""), out result2))
+                            {
+                                image.Height = Unit.FromPoint((double)result2 * 0.75);
+                            }
+                        }
+                        if (!flag)
+                        {
+                            image.LockAspectRatio = true;
+                            image.Width = unit;
+                        }
+                        if (image.Width > unit)
+                        {
+                            image.LockAspectRatio = true;
+                            image.Width = unit;
+                        }
+                        paragraph.Format.Alignment = ParagraphAlignment.Center;
+                    }
+                    catch (Exception)
+                    {
+                        Paragraph paragraph2 = cell.AddParagraph();
+                        paragraph2.AddText("[Image could not be loaded - ProcessTableCellContent]");
+                    }
+                }
+                else if (item.Name.Equals("figure", StringComparison.OrdinalIgnoreCase))
+                {
+                    HtmlNode htmlNode = item.SelectSingleNode(".//img");
+                    if (htmlNode != null)
+                    {
+                        try
+                        {
+                            Paragraph para = cell.AddParagraph();
+                            int index2 = cell.Column.Index;
+                            Unit width2 = cell.Table.Columns[index2].Width;
+                            Unit value = width2 - Unit.FromCentimeter(0.2);
+                            AddImageToParagraph(para, htmlNode, value);
+                        }
+                        catch (Exception)
+                        {
+                            Paragraph paragraph3 = cell.AddParagraph();
+                            paragraph3.AddText("[Image could not be loaded - Figure]");
+                        }
+                    }
+                    HtmlNode htmlNode2 = item.SelectSingleNode(".//figcaption");
+                    if (htmlNode2 != null && !string.IsNullOrWhiteSpace(htmlNode2.InnerText))
+                    {
+                        Paragraph paragraph4 = cell.AddParagraph();
+                        FormattedText formattedText = paragraph4.AddFormattedText(WebUtility.HtmlDecode(htmlNode2.InnerText.Trim()));
+                        formattedText.Italic = true;
+                        paragraph4.Format.Alignment = ParagraphAlignment.Center;
+                    }
+                }
+                else if (item.Name.Equals("video", StringComparison.OrdinalIgnoreCase))
+                {
+                    string attributeValue4 = item.GetAttributeValue("src", string.Empty);
+                    attributeValue4 = HttpUtility.HtmlDecode(attributeValue4);
+                    attributeValue4 = CleanUrl(attributeValue4);
+                    if (!string.IsNullOrEmpty(attributeValue4))
+                    {
+                        Paragraph paragraph5 = cell.AddParagraph();
+                        Hyperlink hyperlink = paragraph5.AddHyperlink(attributeValue4, HyperlinkType.Web);
+                        FormattedText formattedText2 = hyperlink.AddFormattedText("Video: " + attributeValue4);
+                        formattedText2.Color = new MigraDoc.DocumentObjectModel.Color(0, 106, 138);
+                        formattedText2.Underline = Underline.Single;
+                    }
+                }
+                else if (item.Name.Equals("strong", StringComparison.OrdinalIgnoreCase))
+                {
+                    Paragraph paragraph6 = cell.AddParagraph();
+                    paragraph6.AddText(WebUtility.HtmlDecode(item.InnerText));
+                    paragraph6.Format.Font.Bold = true;
+                    paragraph6.Format.SpaceAfter = Unit.FromPoint(6.0);
+                    paragraph6.Format.SpaceBefore = Unit.FromPoint(6.0);
+                }
+                else if (item.Name.Equals("h1", StringComparison.OrdinalIgnoreCase) || item.Name.Equals("h2", StringComparison.OrdinalIgnoreCase) || item.Name.Equals("h3", StringComparison.OrdinalIgnoreCase) || item.Name.Equals("h4", StringComparison.OrdinalIgnoreCase) || item.Name.Equals("h5", StringComparison.OrdinalIgnoreCase) || item.Name.Equals("h6", StringComparison.OrdinalIgnoreCase))
+                {
+                    Paragraph paragraph7 = cell.AddParagraph();
+                    IEnumerable<HtmlNode> enumerable = item.ChildNodes.Where((HtmlNode n) => n.NodeType == HtmlNodeType.Text);
+                    foreach (HtmlNode item2 in enumerable)
+                    {
+                        if (!string.IsNullOrWhiteSpace(item2.InnerText))
+                            paragraph7.AddText(WebUtility.HtmlDecode(item2.InnerText.Trim()));
+                    }
+
+                    HtmlNodeCollection htmlNodeCollection = item.SelectNodes(".//span");
+                    if (htmlNodeCollection != null)
+                    {
+                        foreach (HtmlNode item3 in htmlNodeCollection)
+                        {
+                            if (string.IsNullOrWhiteSpace(item3.InnerText)) continue;
+                            string attributeValue5 = item3.GetAttributeValue("style", "");
+                            string text2 = ExtractStyleValue(attributeValue5, "color");
+                            string text3 = ExtractStyleValue(attributeValue5, "font-size");
+                            Font font = new Font();
+                            if (!string.IsNullOrEmpty(text2))
+                                font.Color = ParseColor(text2);
+                            if (!string.IsNullOrEmpty(text3))
+                            {
+                                int num = ParseFontSize(text3);
+                                if (num > 0) font.Size = num;
+                            }
+                            FormattedText formattedText3 = paragraph7.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText.Trim()));
+                            if (!string.IsNullOrEmpty(text2))
+                                formattedText3.Font.Color = font.Color;
+                            if (!string.IsNullOrEmpty(text3) && font.Size > 0)
+                                formattedText3.Font.Size = font.Size;
+                        }
+                    }
+
+                    switch (item.Name.ToLower())
+                    {
+                        case "h1":
+                            paragraph7.Format.Font.Size = 24;
+                            paragraph7.Format.Font.Bold = true;
+                            paragraph7.Format.Font.Color = new MigraDoc.DocumentObjectModel.Color(28, 74, 113);
+                            paragraph7.Format.SpaceBefore = Unit.FromPoint(10.0);
+                            paragraph7.Format.SpaceAfter = Unit.FromPoint(14.0);
+                            break;
+                        case "h2":
+                            paragraph7.Format.Font.Size = 18;
+                            paragraph7.Format.Font.Bold = true;
+                            paragraph7.Format.Font.Color = Colors.Black;
+                            paragraph7.Format.SpaceBefore = Unit.FromPoint(10.0);
+                            paragraph7.Format.SpaceAfter = Unit.FromPoint(8.0);
+                            break;
+                        case "h3":
+                            paragraph7.Format.Font.Size = 16;
+                            paragraph7.Format.Font.Bold = false;
+                            paragraph7.Format.Font.Color = Colors.Black;
+                            paragraph7.Format.SpaceBefore = Unit.FromPoint(14.0);
+                            paragraph7.Format.SpaceAfter = Unit.FromPoint(8.0);
+                            break;
+                        case "h4":
+                            paragraph7.Format.Font.Size = 14;
+                            paragraph7.Format.Font.Bold = false;
+                            paragraph7.Format.Font.Color = Colors.Black;
+                            paragraph7.Format.SpaceBefore = Unit.FromPoint(12.0);
+                            paragraph7.Format.SpaceAfter = Unit.FromPoint(8.0);
+                            break;
+                        default:
+                            paragraph7.Format.Font.Size = 12;
+                            paragraph7.Format.Font.Bold = false;
+                            paragraph7.Format.Font.Color = Colors.Black;
+                            paragraph7.Format.SpaceBefore = Unit.FromPoint(6.0);
+                            paragraph7.Format.SpaceAfter = Unit.FromPoint(6.0);
+                            break;
+                    }
+                    paragraph7.Format.KeepWithNext = true;
+                    paragraph7.Format.KeepTogether = true;
+
+                    HtmlNodeCollection htmlNodeCollection2 = item.SelectNodes(".//ul");
+                    if (htmlNodeCollection2 != null)
+                    {
+                        foreach (HtmlNode item4 in htmlNodeCollection2)
+                        {
+                            HtmlNodeCollection htmlNodeCollection3 = item4.SelectNodes("./li");
+                            if (htmlNodeCollection3 == null) continue;
+                            foreach (HtmlNode item5 in htmlNodeCollection3)
+                            {
+                                Paragraph paragraph8 = cell.AddParagraph();
+                                paragraph8.AddText("• ");
+                                IEnumerable<HtmlNode> enumerable2 = item5.ChildNodes.Where((HtmlNode n) => n.NodeType == HtmlNodeType.Text);
+                                foreach (HtmlNode item6 in enumerable2)
+                                {
+                                    if (!string.IsNullOrWhiteSpace(item6.InnerText))
+                                        paragraph8.AddText(WebUtility.HtmlDecode(item6.InnerText.Trim()));
+                                }
+                                HtmlNodeCollection htmlNodeCollection4 = item5.SelectNodes("./span");
+                                if (htmlNodeCollection4 != null)
+                                {
+                                    foreach (HtmlNode item7 in htmlNodeCollection4)
+                                    {
+                                        if (string.IsNullOrWhiteSpace(item7.InnerText)) continue;
+                                        string attributeValue6 = item7.GetAttributeValue("style", "");
+                                        string text4 = ExtractStyleValue(attributeValue6, "color");
+                                        string text5 = ExtractStyleValue(attributeValue6, "font-size");
+                                        FormattedText formattedText4 = paragraph8.AddFormattedText(WebUtility.HtmlDecode(item7.InnerText.Trim()));
+                                        if (!string.IsNullOrEmpty(text4))
+                                            formattedText4.Font.Color = ParseColor(text4);
+                                        if (!string.IsNullOrEmpty(text5))
+                                        {
+                                            int num2 = ParseFontSize(text5);
+                                            if (num2 > 0)
+                                                formattedText4.Font.Size = num2;
+                                        }
+                                    }
+                                }
+                                paragraph8.Format.SpaceBefore = Unit.FromPoint(6.0);
+                                paragraph8.Format.SpaceAfter = Unit.FromPoint(6.0);
+                            }
+                        }
+                    }
+                }
+                else if (item.Name.Equals("ul", StringComparison.OrdinalIgnoreCase))
+                {
+                    HtmlNodeCollection htmlNodeCollection5 = item.SelectNodes("./li");
+                    if (htmlNodeCollection5 == null) continue;
+                    foreach (HtmlNode item8 in htmlNodeCollection5)
+                    {
+                        Paragraph paragraph9 = cell.AddParagraph();
+                        paragraph9.Format.LeftIndent = Unit.FromCentimeter(0.2);
+                        paragraph9.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
+
+                        HtmlNodeCollection htmlNodeCollection6 = item8.SelectNodes("./p");
+                        if (htmlNodeCollection6 != null && htmlNodeCollection6.Count > 0)
+                        {
+                            foreach (HtmlNode item9 in htmlNodeCollection6)
+                            {
+                                if (item9 == htmlNodeCollection6[0])
+                                {
+                                    paragraph9.AddText("• ");
+                                    paragraph9.AddText(WebUtility.HtmlDecode(item9.InnerText.Trim()));
+                                    continue;
+                                }
+                                Paragraph paragraph10 = cell.AddParagraph();
+                                paragraph10.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                                paragraph10.AddText(WebUtility.HtmlDecode(item9.InnerText.Trim()));
+                                paragraph10.Format.SpaceAfter = Unit.FromPoint(3.0);
+                            }
+                        }
+                        else
+                        {
+                            IEnumerable<HtmlNode> enumerable3 = item8.ChildNodes.Where((HtmlNode n) => n.NodeType == HtmlNodeType.Text);
+                            foreach (HtmlNode item10 in enumerable3)
+                            {
+                                if (!string.IsNullOrWhiteSpace(item10.InnerText))
+                                {
+                                    paragraph9.AddText("• ");
+                                    paragraph9.AddText(WebUtility.HtmlDecode(item10.InnerText.Trim()));
+                                }
+                            }
+                            HtmlNodeCollection htmlNodeCollection7 = item8.SelectNodes(".//span");
+                            if (htmlNodeCollection7 != null)
+                            {
+                                foreach (HtmlNode item11 in htmlNodeCollection7)
+                                {
+                                    if (string.IsNullOrWhiteSpace(item11.InnerText)) continue;
+                                    string attributeValue7 = item11.GetAttributeValue("style", "");
+                                    string text6 = ExtractStyleValue(attributeValue7, "color");
+                                    string text7 = ExtractStyleValue(attributeValue7, "font-size");
+                                    FormattedText formattedText5 = paragraph9.AddFormattedText(WebUtility.HtmlDecode(item11.InnerText.Trim()));
+                                    if (!string.IsNullOrEmpty(text6))
+                                        formattedText5.Font.Color = ParseColor(text6);
+                                    if (!string.IsNullOrEmpty(text7))
+                                    {
+                                        int num3 = ParseFontSize(text7);
+                                        if (num3 > 0)
+                                            formattedText5.Font.Size = num3;
+                                    }
+                                }
+                            }
+                        }
+                        paragraph9.Format.SpaceBefore = Unit.FromPoint(6.0);
+                        paragraph9.Format.SpaceAfter = Unit.FromPoint(6.0);
+                    }
+                }
+                else if (item.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
+                {
+                    Paragraph paragraph11 = cell.AddParagraph();
+                    paragraph11.Format.KeepTogether = true;
+                    HtmlNode htmlNode3 = item.SelectSingleNode(".//img");
+                    if (htmlNode3 != null)
+                    {
+                        string attributeValue8 = htmlNode3.GetAttributeValue("src", "");
+                        if (!string.IsNullOrEmpty(attributeValue8))
+                        {
+                            try
+                            {
+                                string text8 = HttpUtility.HtmlDecode(attributeValue8);
+
+                                // Change #5: Use image cache
+                                string localPath = DownloadImageCached(text8);
+                                if (localPath != null)
+                                {
+                                    Image image2 = paragraph11.AddImage(localPath);
+                                    int index3 = cell.Column.Index;
+                                    if (index3 >= 0 && index3 < cell.Table.Columns.Count)
+                                        image2.Width = Unit.FromCentimeter(cell.Table.Columns[index3].Width.Centimeter - 0.5);
+                                    else
+                                        image2.Width = Unit.FromCentimeter(5.0);
+                                    image2.LockAspectRatio = true;
+                                }
+                            }
+                            catch (Exception ex3)
+                            {
+                                paragraph11.AddText(ex3.Message);
+                            }
                         }
                     }
                     else
                     {
-                        // Just an hr with no paragraphs
-                        return true;
+                        AddInlineParagraphContent(paragraph11, item, false, false, false, null, null);
                     }
+                    paragraph11.Format.SpaceBefore = Unit.FromPoint(6.0);
+                    paragraph11.Format.SpaceAfter = Unit.FromPoint(6.0);
                 }
-
-                // Check if cell has any non-whitespace content
-                if (!string.IsNullOrWhiteSpace(cellNode.InnerText))
+                else if (item.NodeType == HtmlNodeType.Text && !string.IsNullOrWhiteSpace(item.InnerText))
                 {
-                    return false; // Cell has content, row is not blank
-                }
-
-                // Check for images or other elements that might not have text
-                if (cellNode.SelectNodes(".//img") != null ||
-                    cellNode.SelectNodes(".//table") != null ||
-                    cellNode.SelectNodes(".//ul") != null ||
-                    cellNode.SelectNodes(".//ol") != null)
-                {
-                    return false; // Cell has non-text content, row is not blank
+                    Paragraph paragraph12 = cell.AddParagraph();
+                    paragraph12.AddText(WebUtility.HtmlDecode(item.InnerText.Trim()));
+                    paragraph12.Format.SpaceAfter = Unit.FromPoint(0.3);
+                    paragraph12.Format.SpaceBefore = Unit.FromPoint(0.3);
                 }
             }
-
-            // If we get here, all cells were empty
-            return true;
         }
-
-        // Helper method to calculate dynamic column widths based on content
-        private double[] CalculateColumnWidths(HtmlNode tableNode, int columnCount)
-        {
-            var columnWidths = new double[columnCount];
-            var maxContentLengths = new int[columnCount];
-
-            // Calculate available width (page width - left/right margins)
-            double availableWidth = 16.0; // Standard A4 width minus margins
-
-            // Analyze all rows to find maximum content length per column
-            var rows = tableNode.SelectNodes(".//tr");
-            if (rows != null)
-            {
-                foreach (var row in rows)
-                {
-                    var cells = row.SelectNodes(".//th|.//td");
-                    if (cells != null)
-                    {
-                        for (int i = 0; i < cells.Count && i < columnCount; i++)
-                        {
-                            string cellText = cells[i].InnerText?.Trim() ?? "";
-                            // Remove HTML entities and get actual text length
-                            cellText = System.Net.WebUtility.HtmlDecode(cellText);
-                            maxContentLengths[i] = Math.Max(maxContentLengths[i], cellText.Length);
-                        }
-                    }
-                }
-            }
-
-            // Calculate total content weight
-            int totalContentLength = maxContentLengths.Sum();
-
-            if (totalContentLength == 0)
-            {
-
-                // If no content, distribute equally
-                double equalWidth = availableWidth / columnCount;
-                for (int i = 0; i < columnCount; i++)
-                {
-                    columnWidths[i] = equalWidth;
-                }
-            }
-            else
-            {
-                // Distribute width based on content length with minimum and maximum constraints
-                double minColumnWidth = 2.0; // Minimum 2cm per column
-                double maxColumnWidth = availableWidth * 0.6; // Maximum 60% of available width
-
-                for (int i = 0; i < columnCount; i++)
-                {
-                    // Calculate proportional width based on content
-                    double proportionalWidth = (double)maxContentLengths[i] / totalContentLength * availableWidth;
-
-                    // Apply constraints
-                    columnWidths[i] = Math.Max(minColumnWidth, Math.Min(maxColumnWidth, proportionalWidth));
-                }
-
-                // Ensure total width doesn't exceed available width
-                double totalCalculatedWidth = columnWidths.Sum();
-                if (totalCalculatedWidth > availableWidth)
-                {
-                    // Scale down proportionally
-                    double scaleFactor = availableWidth / totalCalculatedWidth;
-                    for (int i = 0; i < columnCount; i++)
-                    {
-                        columnWidths[i] *= scaleFactor;
-                    }
-                }
-                else if (totalCalculatedWidth < availableWidth)
-                {
-                    // Distribute remaining width equally
-                    double remainingWidth = availableWidth - totalCalculatedWidth;
-                    double additionalWidth = remainingWidth / columnCount;
-                    for (int i = 0; i < columnCount; i++)
-                    {
-                        columnWidths[i] += additionalWidth;
-                    }
-                }
-            }
-
-            return columnWidths;
-        }
-
-
-
     }
 
     public class UrlRequestModel
@@ -3875,9 +2731,4 @@ namespace PickupAPi.Controllers
     {
         public string ArticleId { get; set; }
     }
-
-    //public class HtmlRequestModel
-    //{
-    //    public string HtmlContent { get; set; }
-    //}
 }
