@@ -369,3 +369,5 @@ bin
 App_Data
 *.pdf
 prod_live
+bin/
+obj/

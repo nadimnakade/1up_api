@@ -276,41 +276,23 @@ namespace PickupAPi.Controllers
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found");
                 }
 
-                string text = (string)val.data.category_id;
-                Debug.WriteLine("[PDF-GFU] Category ID: " + text);
-                if (string.IsNullOrEmpty(text))
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article has no category_id");
+                string articleId = (string)val.data.id;
+                string articleTitle = (string)val.data.title;
+                Debug.WriteLine("[PDF-GFU] Article ID: " + articleId + ", Title: " + articleTitle);
 
-                dynamic val2 = JsonConvert.DeserializeObject(await GetCategoryArticles(text));
+                dynamic val2 = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
                 if (val2?.data == null)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Category not found");
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article detail not found");
 
-                string categoryName = ((string)val2.data.name) ?? "Section";
-                List<string> list = ExtractArticleIds(val2.data);
-                Debug.WriteLine("[PDF-GFU] Articles in category: " + list.Count);
-                if (!list.Any())
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found");
+                string categoryName = ((string)val2.data.title) ?? Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
+                string value2 = ((string)val2.data.html_content) ?? "";
+                Debug.WriteLine("[PDF-GFU] Article html_len=" + (value2?.Length ?? 0));
 
                 StringBuilder fullHtml = new StringBuilder();
-                foreach (string articleId in list)
+                if (!string.IsNullOrWhiteSpace(value2))
                 {
-                    try
-                    {
-                        object obj = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
-                        string value = ((string)((dynamic)obj)?.data?.title) ?? "";
-                        string value2 = ((string)((dynamic)obj)?.data?.html_content) ?? "";
-                        Debug.WriteLine("[PDF-GFU] Article " + articleId + " title='" + value + "' html_len=" + (value2?.Length ?? 0));
-                        if (!string.IsNullOrWhiteSpace(value2))
-                        {
-                            fullHtml.Append("<h1>" + WebUtility.HtmlEncode(value) + "</h1>");
-                            fullHtml.Append(value2);
-                            fullHtml.Append("<hr style='page-break-after:always;'/>");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine("[PDF-GFU] Skipping article " + articleId + ": " + ex.Message);
-                    }
+                    fullHtml.Append("<h1>" + WebUtility.HtmlEncode(categoryName) + "</h1>");
+                    fullHtml.Append(value2);
                 }
 
                 Debug.WriteLine("[PDF-GFU] Total HTML length: " + fullHtml.Length);
