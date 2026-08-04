@@ -13,7 +13,6 @@ namespace PickupAPi
     {
         protected void Application_Start()
         {
-            // Set font resolver BEFORE any PdfSharp type is loaded
             PdfSharp.Fonts.GlobalFontSettings.FontResolver = new PickupAPi.Utils.ArialFontResolver();
             System.Diagnostics.Debug.WriteLine("[AppStart] Font resolver set to ArialFontResolver");
 
@@ -24,14 +23,23 @@ namespace PickupAPi
             BundleConfig.RegisterBundles(BundleTable.Bundles);
         }
 
-        protected void Application_EndRequest()
+        protected void Application_BeginRequest()
         {
-            if (Context.Response.StatusCode == 405 && Context.Request.HttpMethod == "OPTIONS")
+            Context.Response.Headers.Remove("Access-Control-Allow-Origin");
+            Context.Response.Headers.Remove("Access-Control-Allow-Methods");
+            Context.Response.Headers.Remove("Access-Control-Allow-Headers");
+            Context.Response.Headers.Remove("Access-Control-Max-Age");
+
+            Context.Response.AddHeader("Access-Control-Allow-Origin", "*");
+            Context.Response.AddHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            Context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Requested-With");
+            Context.Response.AddHeader("Access-Control-Max-Age", "86400");
+
+            if (Context.Request.HttpMethod == "OPTIONS")
             {
-                Response.Clear();
-                Response.StatusCode = 200;
-                Response.End();
+                Context.Response.StatusCode = 200;
+                Context.Response.End();
             }
-        }
+        }       
     }
 }

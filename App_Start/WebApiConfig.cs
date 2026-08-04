@@ -15,10 +15,9 @@ namespace PickupAPi
         public static void Register(HttpConfiguration config)
         {
             // Web API configuration and services
-
-            // Web API routes
-            //var cors = new EnableCorsAttribute("https://nomadix-kms.document360.io", "*", "*");
-            //config.EnableCors();
+            // Enable CORS with wildcard - allow all origins, headers, and methods
+            //var cors = new EnableCorsAttribute("*", "*", "*");
+            //config.EnableCors(cors);
 
             //config.Routes.MapHttpRoute
             //(

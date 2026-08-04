@@ -26,6 +26,7 @@ using System.Web.Http.Description;
 namespace PickupAPi.Controllers
 {
     [RoutePrefix("api/BusinessPdf")]
+    //[EnableCors(origins: "https://kms.cloud.global", headers: "*", methods: "*")]
     public class _BusinessPdfController : ApiController
     {
         public class UrlRequestModel
