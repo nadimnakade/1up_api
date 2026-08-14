@@ -309,9 +309,11 @@ namespace PickupAPi.Controllers
                 response.Content = new ByteArrayContent(pdfBytes);
                 response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
                 response.Content.Headers.ContentLength = pdfBytes.Length;
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string safeName = string.Concat(categoryName.Split(Path.GetInvalidFileNameChars())).Replace(" ", "_");
                 response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("inline")
                 {
-                    FileName = categoryName + ".pdf"
+                    FileName = safeName + "_" + timestamp + ".pdf"
                 };
                 return response;
             }
@@ -523,14 +525,15 @@ namespace PickupAPi.Controllers
 
         private HttpResponseMessage BuildPdfResponse(byte[] pdfBytes, string categoryName)
         {
-            string text = string.Concat((categoryName ?? "Section").Split(Path.GetInvalidFileNameChars()));
+            string text = string.Concat((categoryName ?? "Section").Split(Path.GetInvalidFileNameChars())).Replace(" ", "_");
+            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             HttpResponseMessage val = new HttpResponseMessage(HttpStatusCode.OK);
             val.Content = new ByteArrayContent(pdfBytes);
             val.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
             val.Content.Headers.ContentLength = pdfBytes.Length;
             val.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("inline")
             {
-                FileName = text + ".pdf"
+                FileName = text + "_" + timestamp + ".pdf"
             };
             val.Headers.Add("X-PDF-Size", pdfBytes.Length.ToString());
             return val;
