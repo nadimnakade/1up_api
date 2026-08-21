@@ -680,7 +680,8 @@ namespace PickupAPi.Controllers
                 TopMargin = Unit.FromCentimeter(0.0),
                 BottomMargin = Unit.FromCentimeter(0.0),
                 LeftMargin = Unit.FromCentimeter(0.0),
-                RightMargin = Unit.FromCentimeter(0.0)
+                RightMargin = Unit.FromCentimeter(0.0),
+                FooterDistance = Unit.FromCentimeter(0.0)
             };
 
             Image image = section.AddImage(HttpContext.Current.Server.MapPath("~/logo/header-logo.png"));
@@ -703,8 +704,7 @@ namespace PickupAPi.Controllers
 
             Table table = section.Footers.Primary.AddTable();
             table.Borders.Width = 0;
-            table.AddColumn(Unit.FromCentimeter(16.0));
-            table.AddColumn(Unit.FromCentimeter(5.0));
+            table.AddColumn(Unit.FromCentimeter(21.0));
             Row row = table.AddRow();
             row.Shading.Color = new MigraDoc.DocumentObjectModel.Color(122, 181, 92);
             Paragraph paragraph = row.Cells[0].AddParagraph();
@@ -827,10 +827,26 @@ namespace PickupAPi.Controllers
                 PageWidth = Unit.FromCentimeter(21.0),
                 PageHeight = Unit.FromCentimeter(29.7),
                 TopMargin = Unit.FromCentimeter(2.5),
-                BottomMargin = Unit.FromCentimeter(2.5),
-                LeftMargin = Unit.FromCentimeter(2.5),
-                RightMargin = Unit.FromCentimeter(2.5)
+                BottomMargin = Unit.FromCentimeter(0.0),
+                LeftMargin = Unit.FromCentimeter(0.0),
+                RightMargin = Unit.FromCentimeter(0.0),
+                FooterDistance = Unit.FromCentimeter(0.0)
             };
+
+            Table tocFooter = section.Footers.Primary.AddTable();
+            tocFooter.Borders.Width = 0;
+            tocFooter.AddColumn(Unit.FromCentimeter(21.0));
+            Row tocRow = tocFooter.AddRow();
+            tocRow.Shading.Color = new MigraDoc.DocumentObjectModel.Color(122, 181, 92);
+            Paragraph tocPara = tocRow.Cells[0].AddParagraph();
+            tocPara.AddFormattedText("® NOMADIX", TextFormat.Bold);
+            tocPara.Format.Font.Size = 11;
+            tocPara.Format.Font.Color = Colors.White;
+            tocPara.Format.Alignment = ParagraphAlignment.Left;
+            tocPara.Format.LeftIndent = Unit.FromCentimeter(0.5);
+            tocRow.Cells[0].VerticalAlignment = VerticalAlignment.Center;
+            tocRow.Height = Unit.FromCentimeter(1.4);
+
             doc.Sections.InsertObject(1, section);
             return section;
         }
@@ -845,9 +861,10 @@ namespace PickupAPi.Controllers
                 PageWidth = Unit.FromCentimeter(21.0),
                 PageHeight = Unit.FromCentimeter(29.7),
                 TopMargin = Unit.FromCentimeter(2.5),
-                BottomMargin = Unit.FromCentimeter(2.5),
-                LeftMargin = Unit.FromCentimeter(2.5),
-                RightMargin = Unit.FromCentimeter(2.5)
+                BottomMargin = Unit.FromCentimeter(0.0),
+                LeftMargin = Unit.FromCentimeter(0.0),
+                RightMargin = Unit.FromCentimeter(0.0),
+                FooterDistance = Unit.FromCentimeter(0.0)
             };
 
             Paragraph paragraph = indexSection.AddParagraph("Table of Contents");
@@ -857,14 +874,19 @@ namespace PickupAPi.Controllers
             paragraph.Format.Alignment = ParagraphAlignment.Center;
             paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.5);
             paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.5);
+            paragraph.Format.LeftIndent = Unit.FromCentimeter(2.5);
+            paragraph.Format.RightIndent = Unit.FromCentimeter(2.5);
 
             Paragraph paragraph2 = indexSection.AddParagraph();
             paragraph2.Format.Borders.Bottom.Width = 1;
             paragraph2.Format.Borders.Bottom.Color = Color.FromRgb(81, 162, 198);
             paragraph2.Format.SpaceAfter = Unit.FromCentimeter(1.0);
+            paragraph2.Format.LeftIndent = Unit.FromCentimeter(2.5);
+            paragraph2.Format.RightIndent = Unit.FromCentimeter(2.5);
 
             Table table = indexSection.AddTable();
             table.Borders.Visible = false;
+            table.Rows.LeftIndent = Unit.FromCentimeter(2.5);
             table.AddColumn(Unit.FromCentimeter(1.5));
             table.AddColumn(Unit.FromCentimeter(12.0));
             table.AddColumn(Unit.FromCentimeter(2.5));
