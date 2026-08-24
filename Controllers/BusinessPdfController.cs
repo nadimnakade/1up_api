@@ -154,7 +154,7 @@ namespace PickupAPi.Controllers
                 Console.WriteLine("[DiagHtml] FontResolver type: " + (PdfSharp.Fonts.GlobalFontSettings.FontResolver?.GetType().FullName ?? "NULL"));
                 Console.WriteLine("[DiagHtml] Is64BitProcess: " + Environment.Is64BitProcess);
 
-                byte[] pdfBytes = GenerateBusinessPdf(testHtml);
+                byte[] pdfBytes = null;// GenerateBusinessPdf(testHtml);
                 Console.WriteLine("[DiagHtml] PDF generated: " + pdfBytes.Length + " bytes");
 
                 HttpResponseMessage response = new HttpResponseMessage(HttpStatusCode.OK)
@@ -211,7 +211,7 @@ namespace PickupAPi.Controllers
                 if (PdfSharp.Fonts.GlobalFontSettings.FontResolver == null)
                     PdfSharp.Fonts.GlobalFontSettings.FontResolver = new ArialFontResolver();
 
-                byte[] array = GenerateBusinessPdf(request.htmlContent, request.CoverPageType);
+                byte[] array = null;// GenerateBusinessPdf(request.htmlContent, request.CoverPageType);
 
                 HttpResponseMessage val = new HttpResponseMessage(HttpStatusCode.OK)
                 {
@@ -263,7 +263,10 @@ namespace PickupAPi.Controllers
             if (array != null)
             {
                 Debug.WriteLine("[PDF-GFU] Returning CACHED PDF (" + array.Length + " bytes)");
-                string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
+                string cachedTitle = ReadCachedTitle(cacheFilePath);
+                string fileNameWithoutExtension = !string.IsNullOrWhiteSpace(cachedTitle)
+                    ? cachedTitle
+                    : Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
                 return BuildPdfResponse(array, fileNameWithoutExtension);
             }
 
@@ -285,7 +288,12 @@ namespace PickupAPi.Controllers
                 if (val2?.data == null)
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "Article detail not found");
 
-                string categoryName = ((string)val2.data.title) ?? Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
+                string detailTitle = (string)val2.data.title;
+                string categoryName = !string.IsNullOrWhiteSpace(detailTitle)
+                    ? detailTitle
+                    : (!string.IsNullOrWhiteSpace(articleTitle)
+                        ? articleTitle
+                        : Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document"));
                 string value2 = ((string)val2.data.html_content) ?? "";
                 Debug.WriteLine("[PDF-GFU] Article html_len=" + (value2?.Length ?? 0));
 
@@ -301,9 +309,9 @@ namespace PickupAPi.Controllers
                     return Request.CreateResponse(HttpStatusCode.BadRequest, "No content retrieved");
 
                 Debug.WriteLine("[PDF-GFU] Calling GenerateBusinessPdf...");
-                byte[] pdfBytes = GenerateBusinessPdf(fullHtml.ToString());
+                byte[] pdfBytes = GenerateBusinessPdf(fullHtml.ToString(),0, articleTitle);
                 Debug.WriteLine("[PDF-GFU] PDF generated: " + pdfBytes.Length + " bytes");
-                SavePdfToCache(cacheFilePath, pdfBytes);
+                SavePdfToCache(cacheFilePath, pdfBytes, categoryName);
 
                 var response = Request.CreateResponse(HttpStatusCode.OK);
                 response.Content = new ByteArrayContent(pdfBytes);
@@ -313,7 +321,7 @@ namespace PickupAPi.Controllers
                 string safeName = string.Concat(categoryName.Split(Path.GetInvalidFileNameChars())).Replace(" ", "_");
                 response.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("inline")
                 {
-                    FileName = safeName + "_" + timestamp + ".pdf"
+                    FileName = (string.IsNullOrWhiteSpace(safeName) ? "Document" : safeName) + "_" + timestamp + ".pdf"
                 };
                 return response;
             }
@@ -329,79 +337,7 @@ namespace PickupAPi.Controllers
             }
         }
 
-        // Change #9: Keep old endpoint
-        [HttpPost]
-        [Route("GenerateFromUrl_Old")]
-        public async Task<HttpResponseMessage> GenerateFromUrl_Old([FromBody] UrlRequestModel req)
-        {
-            if (string.IsNullOrWhiteSpace(req?.Url))
-                return Request.CreateResponse(HttpStatusCode.BadRequest, "URL missing");
-
-            try
-            {
-                dynamic val = JsonConvert.DeserializeObject(await GetArticleByUrl(req.Url));
-                if (val?.data == null)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found for the given URL");
-
-                string text = (string)val.data.category_id;
-                if (string.IsNullOrEmpty(text))
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article has no category_id");
-
-                dynamic categoryObj = JsonConvert.DeserializeObject(await GetCategoryArticles(text));
-                if (categoryObj?.data == null)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Category not found");
-
-                List<string> list = ExtractArticleIds(categoryObj.data);
-                if (!list.Any())
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No articles found in category");
-
-                StringBuilder fullHtml = new StringBuilder();
-                foreach (string articleId in list)
-                {
-                    try
-                    {
-                        object obj = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
-                        string value = ((string)((dynamic)obj)?.data?.title) ?? "";
-                        string value2 = ((string)((dynamic)obj)?.data?.html_content) ?? "";
-                        if (!string.IsNullOrWhiteSpace(value2))
-                        {
-                            fullHtml.Append("<h1>" + WebUtility.HtmlEncode(value) + "</h1>");
-                            fullHtml.Append(value2);
-                            fullHtml.Append("<hr style='page-break-after:always;'/>");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("Skipping article " + articleId + ": " + ex.Message);
-                    }
-                }
-
-                if (fullHtml.Length == 0)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "No content could be retrieved");
-
-                byte[] array = GenerateBusinessPdf(fullHtml.ToString());
-                string text2 = ((string)categoryObj.data.name) ?? "Section";
-                string text3 = string.Concat(text2.Split(Path.GetInvalidFileNameChars()));
-                HttpResponseMessage val2 = new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = (HttpContent)new ByteArrayContent(array)
-                };
-                val2.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
-                val2.Content.Headers.ContentDisposition = new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
-                {
-                    FileName = text3 + ".pdf"
-                };
-                return val2;
-            }
-            catch (HttpRequestException ex)
-            {
-                return Request.CreateErrorResponse(HttpStatusCode.BadGateway, "Document360 API unreachable: " + ex.Message);
-            }
-            catch (Exception ex2)
-            {
-                return Request.CreateErrorResponse(HttpStatusCode.InternalServerError, ex2.Message);
-            }
-        }
+        
 
         // Change #8: ClearCache endpoint
         [HttpDelete]
@@ -456,7 +392,7 @@ namespace PickupAPi.Controllers
                     stringBuilder.Append(item2);
                 }
 
-                byte[] array = GenerateBusinessPdf(stringBuilder.ToString());
+                byte[] array = null;// GenerateBusinessPdf(stringBuilder.ToString());
                 HttpResponseMessage val5 = new HttpResponseMessage(HttpStatusCode.OK)
                 {
                     Content = (HttpContent)new ByteArrayContent(array)
@@ -509,18 +445,35 @@ namespace PickupAPi.Controllers
             return null;
         }
 
-        private void SavePdfToCache(string filePath, byte[] pdfBytes)
+        private void SavePdfToCache(string filePath, byte[] pdfBytes, string title = null)
         {
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(filePath));
                 File.WriteAllBytes(filePath, pdfBytes);
+                if (!string.IsNullOrWhiteSpace(title))
+                    File.WriteAllText(filePath + ".title", title.Trim());
                 Console.WriteLine("[PDF Cache] SAVED -> " + filePath);
             }
             catch (Exception ex)
             {
                 Console.WriteLine("[PDF Cache] Write error: " + ex.Message);
             }
+        }
+
+        private string ReadCachedTitle(string filePath)
+        {
+            try
+            {
+                string titlePath = filePath + ".title";
+                if (File.Exists(titlePath))
+                    return File.ReadAllText(titlePath).Trim();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[PDF Cache] Title read error: " + ex.Message);
+            }
+            return null;
         }
 
         private HttpResponseMessage BuildPdfResponse(byte[] pdfBytes, string categoryName)
@@ -596,7 +549,7 @@ namespace PickupAPi.Controllers
         // PDF GENERATION CORE
         // =========================================================================
 
-        public byte[] GenerateBusinessPdf(string htmlContent, int coverPageType = 0)
+        public byte[] GenerateBusinessPdf(string htmlContent, int coverPageType = 0,string article = null)
         {
             Debug.WriteLine("[PDF] === GenerateBusinessPdf START ===");
             Debug.WriteLine("[PDF] HTML length: " + (htmlContent?.Length ?? 0));
@@ -617,7 +570,7 @@ namespace PickupAPi.Controllers
             if (coverPageType == 1)
                 AddCustomCoverPage(document);
             else
-                AddCoverPage(document);
+                AddCoverPage(document, ExtractFirstH1(htmlContent));
 
             Debug.WriteLine("[PDF] Cover page added");
 
@@ -625,7 +578,7 @@ namespace PickupAPi.Controllers
             Section indexSection = CreateAndInsertTocSection(document);
 
             Section section = document.AddSection();
-            AddHeader(section);
+            AddHeader(section, article);
             AddFooter(section);
 
             PageSetup pageSetup = section.PageSetup;
@@ -670,7 +623,7 @@ namespace PickupAPi.Controllers
         // COVER PAGES
         // =========================================================================
 
-        private void AddCoverPage(MigraDoc.DocumentObjectModel.Document doc)
+        private void AddCoverPage(MigraDoc.DocumentObjectModel.Document doc, string articleTitle = null)
         {
             Section section = doc.AddSection();
             section.PageSetup = new PageSetup
@@ -701,6 +654,35 @@ namespace PickupAPi.Controllers
             image2.Top = Unit.FromCentimeter(19.0);
             image2.Left = Unit.FromCentimeter(0.0);
             image2.WrapFormat.Style = WrapStyle.Through;
+
+            // Overlay article title on the banner (covers the baked-in "Nomadix Nexus" text)
+            if (!string.IsNullOrWhiteSpace(articleTitle))
+            {
+                TextFrame titleFrame = section.AddTextFrame();
+                titleFrame.RelativeHorizontal = RelativeHorizontal.Page;
+                titleFrame.RelativeVertical = RelativeVertical.Page;
+                titleFrame.Left = Unit.FromCentimeter(9.3);
+                titleFrame.Top = Unit.FromCentimeter(13.4);
+                titleFrame.Width = Unit.FromCentimeter(10.8);
+                titleFrame.Height = Unit.FromCentimeter(1.8);
+
+                Table titleTable = titleFrame.AddTable();
+                titleTable.Borders.Width = 0;
+                titleTable.AddColumn(Unit.FromCentimeter(10.8));
+                Row titleRow = titleTable.AddRow();
+                titleRow.Shading.Color = new MigraDoc.DocumentObjectModel.Color(28, 74, 113);
+                titleRow.Height = Unit.FromCentimeter(1.8);
+                titleRow.HeightRule = RowHeightRule.Exactly;
+
+                Paragraph titlePara = titleRow.Cells[0].AddParagraph(WebUtility.HtmlDecode(articleTitle).Trim());
+                string trimmedTitle = articleTitle.Trim();
+                titlePara.Format.Font.Size = trimmedTitle.Length > 40 ? 16 : (trimmedTitle.Length > 25 ? 20 : 24);
+                titlePara.Format.Font.Bold = true;
+                titlePara.Format.Font.Color = Colors.White;
+                titlePara.Format.Alignment = ParagraphAlignment.Right;
+                titlePara.Format.RightIndent = Unit.FromCentimeter(0.3);
+                titleRow.Cells[0].VerticalAlignment = VerticalAlignment.Center;
+            }
 
             Table table = section.Footers.Primary.AddTable();
             table.Borders.Width = 0;
@@ -744,7 +726,7 @@ namespace PickupAPi.Controllers
         // HEADER / FOOTER
         // =========================================================================
 
-        private void AddHeader(Section section)
+        private void AddHeader(Section section,string article)
         {
             HeaderFooter primary = section.Headers.Primary;
             Table table = primary.AddTable();
@@ -752,13 +734,13 @@ namespace PickupAPi.Controllers
             table.AddColumn(Unit.FromCentimeter(10.0));
             table.AddColumn(Unit.FromCentimeter(6.0));
             Row row = table.AddRow();
-            Paragraph paragraph = row.Cells[0].AddParagraph("Administration Guide");
+            Paragraph paragraph = row.Cells[0].AddParagraph(article);
             paragraph.Format.Font.Size = 12;
             paragraph.Format.Font.Bold = true;
             paragraph.Format.Alignment = ParagraphAlignment.Left;
             row.Cells[0].VerticalAlignment = VerticalAlignment.Center;
 
-            Paragraph paragraph2 = row.Cells[1].AddParagraph("Nomadix");
+            Paragraph paragraph2 = row.Cells[1].AddParagraph("");
             paragraph2.Format.Font.Size = 14;
             paragraph2.Format.Font.Bold = true;
             paragraph2.Format.Alignment = ParagraphAlignment.Right;
@@ -2105,6 +2087,23 @@ namespace PickupAPi.Controllers
         {
             if (string.IsNullOrEmpty(html)) return string.Empty;
             return Regex.Replace(html, "<.*?>", string.Empty);
+        }
+
+        private string ExtractFirstH1(string html)
+        {
+            if (string.IsNullOrEmpty(html)) return null;
+            try
+            {
+                HtmlDocument doc = new HtmlDocument();
+                doc.LoadHtml(html);
+                HtmlNode h1 = doc.DocumentNode.SelectSingleNode("//h1");
+                string text = h1?.InnerText?.Trim();
+                return string.IsNullOrWhiteSpace(text) ? null : WebUtility.HtmlDecode(text);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private string ExtractStyleValue(string style, string property)
