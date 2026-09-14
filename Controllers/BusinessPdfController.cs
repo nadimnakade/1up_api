@@ -1767,24 +1767,70 @@ namespace PickupAPi.Controllers
             int num = 1;
             foreach (HtmlNode item in node.SelectNodes("./li"))
             {
-                Paragraph paragraph = section.AddParagraph();
-                paragraph.Format.LeftIndent = Unit.FromCentimeter(1.0);
-                paragraph.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
-                paragraph.Format.SpaceBefore = Unit.FromPoint(6.0);
-                paragraph.Format.SpaceAfter = Unit.FromPoint(6.0);
-                paragraph.Format.LineSpacing = Unit.FromPoint(10.0);
+                bool hasBlockElements = item.SelectNodes(".//table|.//div|.//blockquote|.//h1|.//h2|.//h3|.//h4|.//ul|.//ol|.//pre|.//hr") != null;
 
-                if (isOrdered)
+                if (hasBlockElements)
                 {
-                    paragraph.AddText($"{num}. ");
-                    num++;
+                    if (isOrdered)
+                    {
+                        Paragraph numPara = section.AddParagraph();
+                        numPara.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                        numPara.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
+                        numPara.Format.SpaceBefore = Unit.FromPoint(6.0);
+                        numPara.Format.SpaceAfter = Unit.FromPoint(0);
+                        numPara.AddText($"{num}. ");
+                        num++;
+                    }
+
+                    foreach (HtmlNode child in item.ChildNodes)
+                    {
+                        if (child.NodeType == HtmlNodeType.Text)
+                        {
+                            if (!string.IsNullOrWhiteSpace(child.InnerText))
+                            {
+                                Paragraph p = section.AddParagraph();
+                                p.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                                p.Format.SpaceBefore = Unit.FromPoint(2.0);
+                                p.Format.SpaceAfter = Unit.FromPoint(2.0);
+                                p.AddText(WebUtility.HtmlDecode(child.InnerText.Trim()));
+                            }
+                        }
+                        else if (child.NodeType == HtmlNodeType.Element)
+                        {
+                            if (child.Name == "div" && child.HasClass("table-shadow-wrapper"))
+                            {
+                                HtmlNode tableNode = child.SelectSingleNode(".//table");
+                                if (tableNode != null)
+                                    AddTable(section, tableNode);
+                            }
+                            else
+                            {
+                                ProcessHtmlNode(child, section);
+                            }
+                        }
+                    }
                 }
                 else
                 {
-                    paragraph.AddText("• ");
-                }
+                    Paragraph paragraph = section.AddParagraph();
+                    paragraph.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                    paragraph.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
+                    paragraph.Format.SpaceBefore = Unit.FromPoint(6.0);
+                    paragraph.Format.SpaceAfter = Unit.FromPoint(6.0);
+                    paragraph.Format.LineSpacing = Unit.FromPoint(10.0);
 
-                ProcessInlineElements(paragraph, item);
+                    if (isOrdered)
+                    {
+                        paragraph.AddText($"{num}. ");
+                        num++;
+                    }
+                    else
+                    {
+                        paragraph.AddText("• ");
+                    }
+
+                    ProcessInlineElements(paragraph, item);
+                }
             }
         }
 
@@ -2234,58 +2280,9 @@ namespace PickupAPi.Controllers
         private double[] CalculateColumnWidths(HtmlNode tableNode, int columnCount)
         {
             double[] array = new double[columnCount];
-            int[] array2 = new int[columnCount];
-            double num = 16.0;
-
-            HtmlNodeCollection htmlNodeCollection = tableNode.SelectNodes(".//tr");
-            if (htmlNodeCollection != null)
-            {
-                foreach (HtmlNode item in htmlNodeCollection)
-                {
-                    HtmlNodeCollection htmlNodeCollection2 = item.SelectNodes(".//th|.//td");
-                    if (htmlNodeCollection2 != null)
-                    {
-                        for (int i = 0; i < htmlNodeCollection2.Count && i < columnCount; i++)
-                        {
-                            string value = htmlNodeCollection2[i].InnerText?.Trim() ?? "";
-                            value = WebUtility.HtmlDecode(value);
-                            array2[i] = Math.Max(array2[i], value.Length);
-                        }
-                    }
-                }
-            }
-
-            int num2 = array2.Sum();
-            if (num2 == 0)
-            {
-                double num3 = num / (double)columnCount;
-                for (int j = 0; j < columnCount; j++)
-                    array[j] = num3;
-            }
-            else
-            {
-                double val = 2.0;
-                double val2 = num * 0.6;
-                for (int k = 0; k < columnCount; k++)
-                {
-                    double val3 = (double)array2[k] / (double)num2 * num;
-                    array[k] = Math.Max(val, Math.Min(val2, val3));
-                }
-                double num4 = array.Sum();
-                if (num4 > num)
-                {
-                    double num5 = num / num4;
-                    for (int l = 0; l < columnCount; l++)
-                        array[l] *= num5;
-                }
-                else if (num4 < num)
-                {
-                    double num6 = num - num4;
-                    double num7 = num6 / (double)columnCount;
-                    for (int m = 0; m < columnCount; m++)
-                        array[m] += num7;
-                }
-            }
+            double colWidth = 16.0 / columnCount;
+            for (int i = 0; i < columnCount; i++)
+                array[i] = colWidth;
             return array;
         }
 
