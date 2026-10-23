@@ -24,6 +24,8 @@ using System.Net.Http.Headers;
 using DialerAPi.Models;
 using System.Web.Script.Serialization;
 using System.Web.Http.Cors;
+using System.Data;
+using System.Data.SqlClient;
 using System.Threading.Tasks;
 
 namespace PickupAPi.Controllers
@@ -1062,9 +1064,35 @@ namespace PickupAPi.Controllers
 
 
 
+        [AcceptVerbs("GET", "POST")]
+        public HttpResponseMessage GetExtension(int EmpCode)
+        {
+            Dialer obj = new Dialer();
+            EmployeeExtension employeeExtension = obj.fnGetCloudCallingDetails(EmpCode);
+
+            var jsonSerializer = JsonConvert.SerializeObject(employeeExtension);
+            if (!string.IsNullOrEmpty(jsonSerializer))
+            {
+                var response = this.Request.CreateResponse(HttpStatusCode.OK);
+                response.Content = new StringContent(jsonSerializer, Encoding.UTF8, "application/json");
+                return response;
+            }
+            throw new HttpResponseException(HttpStatusCode.NotFound);
+        }
+
+        [AcceptVerbs("GET", "POST")]
+        public string UpdateNewDialerStatus(int EmpCode)
+        {
+            SqlCommand com = new SqlCommand();
+            com.CommandType = CommandType.StoredProcedure;
+            com.Parameters.AddWithValue("@EmpCode", EmpCode);
+            int rows = SqlHelper.ExecuteNonQuery(ref com, "USP_UPDATE_NEW_DIALER_STATUS");
+            return rows > 0 ? "Ok" : "Error";
+        }
+
         public static void ErrorLogging(string msg)
         {
-            string strPath = @"C:\Error\Log.txt";
+            string strPath = @"C:\Error\Log_" + DateTime.Now.ToString("yyyyMMdd") + ".txt";
             if (!File.Exists(strPath))
             {
                 File.Create(strPath).Dispose();
@@ -1121,3 +1149,7 @@ public class SpinWheelHistory
     public DateTime SpinDate { get; set; }
     public int CustomerMobileNo { get; set; }
 }
+
+
+
+

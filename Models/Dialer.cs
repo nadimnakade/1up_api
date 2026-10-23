@@ -1,15 +1,16 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Web;
-using System.Data.SqlClient;
-using System.Data;
-using DialerAPi.Models;
-using System.Configuration;
-using PickupAPi.Models;
-using System.ComponentModel.DataAnnotations;
-using System.Reflection;
+﻿using DialerAPi.Models;
 using iTextSharp.text;
+using PickupAPi.Models;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Configuration;
+using System.Data;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
+using System.Web;
 
 namespace DialerAPi.Models
 {
@@ -1626,6 +1627,49 @@ namespace DialerAPi.Models
                 throw ex;
             }
             return GetSpinCount;
+        }
+
+        public EmployeeExtension fnGetCloudCallingDetails(int UserKey)
+        {
+            EmployeeExtension employeeExtension = null;
+            try
+            {
+                DataSet ds = new DataSet();
+                SqlCommand _cmd = new SqlCommand();
+                _cmd.CommandTimeout = 180;
+
+
+                _cmd.Parameters.Add(new SqlParameter("@UserKey", UserKey));
+
+
+                ds = SqlHelper.ExecuteDS(ref _cmd, "USP_GET_EMPLOYEE_EXTENSION_API");
+
+                if (ds.Tables[0].Rows.Count > 0)
+                {
+
+                    var result = new EmployeeExtension
+                    {
+                        EmpCode = Convert.ToInt32(ds.Tables[0].Rows[0]["EmpCode"]),
+                        DidNumber = Convert.ToString(ds.Tables[0].Rows[0]["DidNumber"]),
+                        Extension = Convert.ToString(ds.Tables[0].Rows[0]["Extension"]),
+                        Status = Convert.ToString(ds.Tables[0].Rows[0]["Status"]),
+                        BaseUrl = Convert.ToString(ds.Tables[0].Rows[0]["BaseUrl"]),
+                        Click2CallPath = Convert.ToString(ds.Tables[0].Rows[0]["Click2CallPath"]),
+                        TokenId = Convert.ToString(ds.Tables[0].Rows[0]["TokenId"]),
+                        ExtensionPassword = Convert.ToString(ds.Tables[0].Rows[0]["ExtensionPassword"]),
+                        SipServer = Convert.ToString(ds.Tables[0].Rows[0]["SipServer"]),
+                        SipPort = Convert.ToInt32(ds.Tables[0].Rows[0]["SipPort"]),
+                        SipPassword = Convert.ToString(ds.Tables[0].Rows[0]["SipPassword"]),
+                        SipRealm = Convert.ToString(ds.Tables[0].Rows[0]["SipRealm"])
+                    };
+
+                }
+            }
+            catch (Exception ex)
+            {
+                throw ex;
+            }
+            return employeeExtension;
         }
 
 

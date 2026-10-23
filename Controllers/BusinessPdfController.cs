@@ -9,6 +9,7 @@ using PickupAPi.Utils;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -273,28 +274,42 @@ namespace PickupAPi.Controllers
             try
             {
                 Debug.WriteLine("[PDF-GFU] Fetching article from API...");
-                dynamic val = JsonConvert.DeserializeObject(await GetArticleByUrl(req.Url));
-                if (val?.data == null)
+                string articleTitle;
+                string value2;
+
+                try
                 {
-                    Debug.WriteLine("[PDF-GFU] Article not found!");
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found");
+                    dynamic val = JsonConvert.DeserializeObject(await GetArticleByUrl(req.Url));
+                    if (val?.data == null)
+                    {
+                        Debug.WriteLine("[PDF-GFU] Article not found!");
+                        return Request.CreateResponse(HttpStatusCode.BadRequest, "Article not found");
+                    }
+
+                    string articleId = (string)val.data.id;
+                    articleTitle = (string)val.data.title;
+                    Debug.WriteLine("[PDF-GFU] Article ID: " + articleId + ", Title: " + articleTitle);
+
+                    dynamic val2 = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
+                    if (val2?.data == null)
+                        return Request.CreateResponse(HttpStatusCode.BadRequest, "Article detail not found");
+
+                    string detailTitle = (string)val2.data.title;
+                    if (!string.IsNullOrWhiteSpace(detailTitle))
+                        articleTitle = detailTitle;
+                    value2 = ((string)val2.data.html_content) ?? "";
+                }
+                catch (HttpRequestException apiException)
+                {
+                    Debug.WriteLine("[PDF-GFU] Document360 URL lookup failed; using public-page fallback: " + apiException.Message);
+                    Tuple<string, string> publicArticle = await GetArticleFromPublicPage(req.Url);
+                    articleTitle = publicArticle.Item1;
+                    value2 = publicArticle.Item2;
                 }
 
-                string articleId = (string)val.data.id;
-                string articleTitle = (string)val.data.title;
-                Debug.WriteLine("[PDF-GFU] Article ID: " + articleId + ", Title: " + articleTitle);
-
-                dynamic val2 = JsonConvert.DeserializeObject(await GetArticleDetail(articleId));
-                if (val2?.data == null)
-                    return Request.CreateResponse(HttpStatusCode.BadRequest, "Article detail not found");
-
-                string detailTitle = (string)val2.data.title;
-                string categoryName = !string.IsNullOrWhiteSpace(detailTitle)
-                    ? detailTitle
-                    : (!string.IsNullOrWhiteSpace(articleTitle)
-                        ? articleTitle
-                        : Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document"));
-                string value2 = ((string)val2.data.html_content) ?? "";
+                string categoryName = !string.IsNullOrWhiteSpace(articleTitle)
+                    ? articleTitle
+                    : Path.GetFileNameWithoutExtension(new Uri(req.Url).Segments.LastOrDefault() ?? "Document");
                 Debug.WriteLine("[PDF-GFU] Article html_len=" + (value2?.Length ?? 0));
 
                 StringBuilder fullHtml = new StringBuilder();
@@ -1038,12 +1053,12 @@ namespace PickupAPi.Controllers
             htmlDocument.LoadHtml(htmlContent);
             HtmlNode htmlNode = htmlDocument.DocumentNode.SelectSingleNode("//article");
             if (htmlNode != null)
-                ProcessHtmlNode(htmlNode, section);
+                ProcessHtmlNode(htmlNode, section, isRoot: true);
             else
-                ProcessHtmlNode(htmlDocument.DocumentNode, section);
+                ProcessHtmlNode(htmlDocument.DocumentNode, section, isRoot: true);
         }
 
-        private void ProcessHtmlNode(HtmlNode node, Section section)
+        private void ProcessHtmlNode(HtmlNode node, Section section, bool isRoot = false)
         {
             if (node == null) return;
 
@@ -1065,7 +1080,7 @@ namespace PickupAPi.Controllers
                             AddHeading(section, item.InnerText, "Heading1", 24);
                             break;
                         case "h2":
-                            AddHeading(section, item.InnerText, "Heading2", 18);
+                            AddHeading(section, item.InnerText, "Heading2", 18, pageBreakBefore: isRoot);
                             subsrno++;
                             break;
                         case "h3":
@@ -1102,7 +1117,7 @@ namespace PickupAPi.Controllers
                         case "div":
                         case "article":
                         case "section":
-                            ProcessHtmlNode(item, section);
+                            ProcessHtmlNode(item, section, isRoot: false);
                             break;
                     }
                 }
@@ -1112,24 +1127,40 @@ namespace PickupAPi.Controllers
         private void ProcessBlockquote(Section section, HtmlNode item)
         {
             string iconPath = null;
-            string innerTextTrimmed = item.InnerText.Trim();
+            HtmlNode titleNode = item.SelectSingleNode(
+                ".//*[contains(concat(' ', normalize-space(@class), ' '), ' blockquote-title ')]");
+            string blockquoteTitle = titleNode == null
+                ? string.Empty
+                : WebUtility.HtmlDecode(titleNode.InnerText).Trim();
+            List<HtmlNode> bodyNodes = item.ChildNodes
+                .Where(n => n != titleNode &&
+                            !(n.NodeType == HtmlNodeType.Element && n.HasClass("blockquote-title")))
+                .Where(n => !string.IsNullOrWhiteSpace(n.InnerText)).ToList();
+            bool hasStructuredList = bodyNodes.Any(n =>
+                n.Name.Equals("ul", StringComparison.OrdinalIgnoreCase) ||
+                n.Name.Equals("ol", StringComparison.OrdinalIgnoreCase) ||
+                n.SelectSingleNode(".//ul|.//ol") != null);
+            string blockquoteContent = hasStructuredList
+                ? string.Concat(bodyNodes.Select(n => n.OuterHtml))
+                : string.Join(" ", bodyNodes.Select(n => WebUtility.HtmlDecode(n.InnerText).Trim())).Trim();
 
-            if (innerTextTrimmed.IndexOf("Notes") >= 0)
+            if (blockquoteTitle.Equals("Note", StringComparison.OrdinalIgnoreCase) ||
+                blockquoteTitle.Equals("Notes", StringComparison.OrdinalIgnoreCase))
             {
                 iconPath = HttpContext.Current.Server.MapPath("~/logo/info_icon.png");
-                AddStyledSection(section, "Note", item.InnerText.Trim(),
+                AddStyledSection(section, "Note", blockquoteContent,
                     Color.FromRgb(221, 247, 255), Color.FromRgb(28, 74, 113), iconPath);
             }
-            else if (innerTextTrimmed.IndexOf("Warning") >= 0)
+            else if (blockquoteTitle.Equals("Warning", StringComparison.OrdinalIgnoreCase))
             {
                 iconPath = HttpContext.Current.Server.MapPath("~/logo/warning_icon.png");
-                AddStyledSection(section, "Warning", item.InnerText.Trim(),
+                AddStyledSection(section, "Warning", blockquoteContent,
                     Color.FromRgb(253, 242, 206), Color.FromRgb(127, 100, 22), iconPath);
             }
-            else if (innerTextTrimmed.IndexOf("Tip") >= 0)
+            else if (blockquoteTitle.Equals("Tip", StringComparison.OrdinalIgnoreCase))
             {
                 iconPath = HttpContext.Current.Server.MapPath("~/logo/tip_icon.png");
-                AddStyledSection(section, "Tip", item.InnerText.Trim(),
+                AddStyledSection(section, "Tip", blockquoteContent,
                     Color.FromRgb(139, 195, 74), Colors.White, iconPath);
             }
         }
@@ -1173,13 +1204,13 @@ namespace PickupAPi.Controllers
             paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.4);
 
             string cleanedContent = CleanContent(content2, title);
-            Paragraph paragraph2 = cell.AddParagraph();
-            if (cleanedContent.Contains("<li>") || cleanedContent.Contains("<ul>"))
+            if (Regex.IsMatch(cleanedContent, @"<\s*(ul|ol|li)\b", RegexOptions.IgnoreCase))
             {
                 ProcessListContent(cell, cleanedContent, textColor);
             }
             else
             {
+                Paragraph paragraph2 = cell.AddParagraph();
                 paragraph2.AddText(cleanedContent);
                 paragraph2.Format.Font.Color = textColor;
                 paragraph2.Format.Font.Size = 10;
@@ -1226,18 +1257,18 @@ namespace PickupAPi.Controllers
 
         private string CleanContent(string content, string title)
         {
-            string text = content;
+            string text = content ?? string.Empty;
             switch (title.ToLower())
             {
                 case "note":
                 case "notes":
-                    text = text.Replace("Notes:", "").Replace("Note:", "").Replace("Note", "").Trim();
+                    text = Regex.Replace(text, @"^\s*Notes?\s*:?\s*", "", RegexOptions.IgnoreCase).Trim();
                     break;
                 case "warning":
-                    text = text.Replace("Warning:", "").Replace("Warning", "").Trim();
+                    text = Regex.Replace(text, @"^\s*Warning\s*:?\s*", "", RegexOptions.IgnoreCase).Trim();
                     break;
                 case "tip":
-                    text = text.Replace("Tip:", "").Replace("Tip", "").Trim();
+                    text = Regex.Replace(text, @"^\s*Tip\s*:?\s*", "", RegexOptions.IgnoreCase).Trim();
                     break;
             }
             return text;
@@ -1248,86 +1279,53 @@ namespace PickupAPi.Controllers
             HtmlDocument htmlDocument = new HtmlDocument();
             htmlDocument.LoadHtml(mainContent);
 
-            IEnumerable<string> enumerable = from n in htmlDocument.DocumentNode.ChildNodes
-                                             where n.NodeType == HtmlNodeType.Text
-                                             select n.InnerText.Trim() into t
-                                             where !string.IsNullOrWhiteSpace(t)
-                                             select t;
-
-            foreach (string item in enumerable)
+            foreach (HtmlNode node in htmlDocument.DocumentNode.ChildNodes)
             {
-                Paragraph paragraph = contentCell.AddParagraph();
-                paragraph.AddText(item);
-                paragraph.Format.Font.Color = textColor;
-                paragraph.Format.Font.Size = 10;
-                paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.1);
-            }
-
-            HtmlNodeCollection htmlNodeCollection = htmlDocument.DocumentNode.SelectNodes("//ul");
-            if (htmlNodeCollection == null) return;
-
-            foreach (HtmlNode item2 in htmlNodeCollection)
-            {
-                HtmlNodeCollection liNodes = item2.SelectNodes("./li");
-                if (liNodes == null) continue;
-
-                foreach (HtmlNode item3 in liNodes)
+                if (node.NodeType == HtmlNodeType.Text && !string.IsNullOrWhiteSpace(node.InnerText))
                 {
-                    Paragraph paragraph2 = contentCell.AddParagraph();
-                    paragraph2.AddText("• ");
-
-                    foreach (HtmlNode item4 in item3.ChildNodes)
+                    Paragraph textParagraph = contentCell.AddParagraph();
+                    textParagraph.AddText(WebUtility.HtmlDecode(node.InnerText.Trim()));
+                    ApplyStyledBoxTextFormat(textParagraph, textColor);
+                }
+                else if (node.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
+                {
+                    Paragraph bodyParagraph = contentCell.AddParagraph();
+                    ProcessInlineElements(bodyParagraph, node);
+                    ApplyStyledBoxTextFormat(bodyParagraph, textColor);
+                }
+                else if (node.Name.Equals("ul", StringComparison.OrdinalIgnoreCase) ||
+                         node.Name.Equals("ol", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool ordered = node.Name.Equals("ol", StringComparison.OrdinalIgnoreCase);
+                    int number = 1;
+                    HtmlNodeCollection listItems = node.SelectNodes("./li");
+                    if (listItems == null) continue;
+                    foreach (HtmlNode listItem in listItems)
                     {
-                        if (item4.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
-                        {
-                            foreach (HtmlNode item5 in item4.ChildNodes)
-                            {
-                                if (item5.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    string src = HttpUtility.HtmlDecode(item5.GetAttributeValue("src", ""));
-                                    if (!string.IsNullOrEmpty(src))
-                                        AddImageToParaSection(src, contentCell.Section);
-                                }
-                                else
-                                {
-                                    paragraph2.AddText(WebUtility.HtmlDecode(item5.InnerText));
-                                }
-                            }
-                        }
-                        else if (item4.Name.Equals("div", StringComparison.OrdinalIgnoreCase))
-                        {
-                            HtmlNodeCollection tables = item4.SelectNodes(".//table");
-                            if (tables != null)
-                            {
-                                foreach (HtmlNode item6 in tables)
-                                    AddTableToDocument(paragraph2, item6);
-                            }
-                        }
-                        else if (item4.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string src2 = HttpUtility.HtmlDecode(item4.GetAttributeValue("src", ""));
-                            if (!string.IsNullOrEmpty(src2))
-                                AddImageToParaSection(src2, contentCell.Section);
-                        }
-                        else
-                        {
-                            paragraph2.AddText(WebUtility.HtmlDecode(item4.InnerText));
-                        }
+                        Paragraph listParagraph = contentCell.AddParagraph();
+                        listParagraph.Format.LeftIndent = Unit.FromCentimeter(0.5);
+                        listParagraph.Format.FirstLineIndent = Unit.FromCentimeter(-0.35);
+                        listParagraph.AddText(ordered ? $"{number++}. " : "• ");
+                        ProcessInlineElements(listParagraph, listItem);
+                        ApplyStyledBoxTextFormat(listParagraph, textColor);
                     }
-
-                    paragraph2.Format.Font.Color = textColor;
-                    paragraph2.Format.Font.Size = 10;
-                    paragraph2.Format.SpaceBefore = Unit.FromCentimeter(0.05);
-                    paragraph2.Format.SpaceAfter = Unit.FromCentimeter(0.05);
                 }
             }
+        }
+
+        private static void ApplyStyledBoxTextFormat(Paragraph paragraph, Color textColor)
+        {
+            paragraph.Format.Font.Color = textColor;
+            paragraph.Format.Font.Size = 10;
+            paragraph.Format.SpaceBefore = Unit.FromCentimeter(0.05);
+            paragraph.Format.SpaceAfter = Unit.FromCentimeter(0.1);
         }
 
         // =========================================================================
         // HEADING / PARAGRAPH / IMAGE / LIST
         // =========================================================================
 
-        private void AddHeading(Section section, string text, string style, int fontSize)
+        private void AddHeading(Section section, string text, string style, int fontSize, bool pageBreakBefore = false)
         {
             if (string.IsNullOrWhiteSpace(text)) return;
 
@@ -1347,6 +1345,7 @@ namespace PickupAPi.Controllers
 
             paragraph.Format.KeepWithNext = true;
             paragraph.Format.KeepTogether = true;
+            paragraph.Format.PageBreakBefore = pageBreakBefore;
 
             string text3 = WebUtility.HtmlDecode(StripHtml(text)).Trim();
 
@@ -1376,7 +1375,7 @@ namespace PickupAPi.Controllers
         }
 
         // Change #5: Use image cache
-        private void AddImageToParaSection(string imageUrl, Section section)
+        private void AddImageToParaSection(string imageUrl, Section section, HtmlNode imgNode = null)
         {
             string localPath = null;
             bool downloadedByUs = false;
@@ -1388,13 +1387,6 @@ namespace PickupAPi.Controllers
                 localPath = DownloadImageCached(url);
                 if (localPath == null) return;
 
-                Unit unit;
-                using (System.Drawing.Image image = System.Drawing.Image.FromFile(localPath))
-                {
-                    double value = (double)image.Width / (double)image.HorizontalResolution * 72.0;
-                    unit = Unit.FromPoint(value);
-                }
-
                 Paragraph paragraph = section.AddParagraph();
                 Image image2 = paragraph.AddImage(localPath);
                 image2.LockAspectRatio = true;
@@ -1405,8 +1397,7 @@ namespace PickupAPi.Controllers
                 Unit leftMargin = section.PageSetup.LeftMargin;
                 Unit rightMargin = section.PageSetup.RightMargin;
                 Unit unit2 = pageWidth - leftMargin - rightMargin;
-                double value2 = Math.Min(unit.Point, unit2.Point);
-                image2.Width = Unit.FromPoint(value2);
+                image2.Width = GetRenderedImageWidth(localPath, imgNode, unit2);
                 paragraph.Format.Alignment = ParagraphAlignment.Center;
             }
             catch (Exception ex)
@@ -1483,7 +1474,18 @@ namespace PickupAPi.Controllers
                             formattedText3.Underline = Underline.Single;
                             break;
                         case "a":
-                            FormattedText formattedText2 = para.AddFormattedText(WebUtility.HtmlDecode(item.InnerText));
+                            string href = HttpUtility.HtmlDecode(item.GetAttributeValue("href", string.Empty)).Trim();
+                            string linkText = WebUtility.HtmlDecode(item.InnerText);
+                            FormattedText formattedText2;
+                            if (!string.IsNullOrWhiteSpace(href))
+                            {
+                                Hyperlink webHyperlink = para.AddHyperlink(href, HyperlinkType.Web);
+                                formattedText2 = webHyperlink.AddFormattedText(linkText);
+                            }
+                            else
+                            {
+                                formattedText2 = para.AddFormattedText(linkText);
+                            }
                             formattedText2.Color = new MigraDoc.DocumentObjectModel.Color(0, 106, 138);
                             formattedText2.Underline = Underline.Single;
                             break;
@@ -1501,7 +1503,7 @@ namespace PickupAPi.Controllers
                             {
                                 string text3 = HttpUtility.HtmlDecode(htmlNode2.GetAttributeValue("src", ""));
                                 if (!string.IsNullOrEmpty(text3))
-                                    AddImageToParaSection(text3, para.Section);
+                                    AddImageToParaSection(text3, para.Section, htmlNode2);
                             }
                             break;
                         case "br":
@@ -1512,7 +1514,7 @@ namespace PickupAPi.Controllers
                             attributeValue2 = HttpUtility.HtmlDecode(attributeValue2);
                             attributeValue2 = CleanUrl(attributeValue2);
                             if (!string.IsNullOrEmpty(attributeValue2))
-                                AddImageToParaSection(attributeValue2, para.Section);
+                                AddImageToParaSection(attributeValue2, para.Section, item);
                             break;
                         case "video":
                             string attributeValue = item.GetAttributeValue("src", string.Empty);
@@ -1686,10 +1688,7 @@ namespace PickupAPi.Controllers
                     unit = pageWidth - leftMargin - rightMargin;
                 }
 
-                Unit unit2 = Unit.FromCentimeter(15.0);
-                if (unit2 > unit)
-                    unit2 = unit;
-                image.Width = unit2;
+                image.Width = GetRenderedImageWidth(localPath, imgNode, unit);
                 para.Format.Alignment = ParagraphAlignment.Center;
             }
             catch (Exception ex)
@@ -1748,7 +1747,7 @@ namespace PickupAPi.Controllers
                             {
                                 string src = HttpUtility.HtmlDecode(item5.GetAttributeValue("src", string.Empty));
                                 if (!string.IsNullOrEmpty(src))
-                                    AddImageToParaSection(src, paragraph.Section);
+                                    AddImageToParaSection(src, paragraph.Section, item5);
                             }
                         }
                     }
@@ -1771,16 +1770,8 @@ namespace PickupAPi.Controllers
 
                 if (hasBlockElements)
                 {
-                    if (isOrdered)
-                    {
-                        Paragraph numPara = section.AddParagraph();
-                        numPara.Format.LeftIndent = Unit.FromCentimeter(1.0);
-                        numPara.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
-                        numPara.Format.SpaceBefore = Unit.FromPoint(6.0);
-                        numPara.Format.SpaceAfter = Unit.FromPoint(0);
-                        numPara.AddText($"{num}. ");
-                        num++;
-                    }
+                    string listMarker = isOrdered ? $"{num++}. " : "• ";
+                    bool markerPending = true;
 
                     foreach (HtmlNode child in item.ChildNodes)
                     {
@@ -1790,18 +1781,60 @@ namespace PickupAPi.Controllers
                             {
                                 Paragraph p = section.AddParagraph();
                                 p.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                                p.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
                                 p.Format.SpaceBefore = Unit.FromPoint(2.0);
                                 p.Format.SpaceAfter = Unit.FromPoint(2.0);
+                                p.Format.KeepTogether = true;
+                                if (markerPending)
+                                {
+                                    p.AddText(listMarker);
+                                    markerPending = false;
+                                }
                                 p.AddText(WebUtility.HtmlDecode(child.InnerText.Trim()));
                             }
                         }
                         else if (child.NodeType == HtmlNodeType.Element)
                         {
-                            if (child.Name == "div" && child.HasClass("table-shadow-wrapper"))
+                            if (child.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
+                            {
+                                Paragraph p = section.AddParagraph();
+                                p.Format.LeftIndent = Unit.FromCentimeter(1.0);
+                                p.Format.FirstLineIndent = Unit.FromCentimeter(-0.2);
+                                p.Format.SpaceBefore = Unit.FromPoint(2.0);
+                                p.Format.SpaceAfter = Unit.FromPoint(2.0);
+                                p.Format.KeepTogether = true;
+                                if (markerPending)
+                                {
+                                    p.AddText(listMarker);
+                                    markerPending = false;
+                                }
+                                ProcessInlineElements(p, child);
+                            }
+                            else if (child.Name == "div" && child.HasClass("table-shadow-wrapper"))
                             {
                                 HtmlNode tableNode = child.SelectSingleNode(".//table");
                                 if (tableNode != null)
                                     AddTable(section, tableNode);
+                            }
+                            else if (child.Name.Equals("h1", StringComparison.OrdinalIgnoreCase) ||
+                                     child.Name.Equals("h2", StringComparison.OrdinalIgnoreCase) ||
+                                     child.Name.Equals("h3", StringComparison.OrdinalIgnoreCase) ||
+                                     child.Name.Equals("h4", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string headingStyle = "Heading" + child.Name.Substring(1);
+                                int headingSize = child.Name.Equals("h1", StringComparison.OrdinalIgnoreCase) ? 24 :
+                                    child.Name.Equals("h2", StringComparison.OrdinalIgnoreCase) ? 18 :
+                                    child.Name.Equals("h3", StringComparison.OrdinalIgnoreCase) ? 16 : 14;
+                                AddHeading(section, child.InnerText, headingStyle, headingSize);
+                            }
+                            else if (child.Name.Equals("blockquote", StringComparison.OrdinalIgnoreCase))
+                            {
+                                ProcessBlockquote(section, child);
+                            }
+                            else if (child.Name.Equals("ul", StringComparison.OrdinalIgnoreCase) ||
+                                     child.Name.Equals("ol", StringComparison.OrdinalIgnoreCase))
+                            {
+                                AddList(section, child, child.Name.Equals("ol", StringComparison.OrdinalIgnoreCase));
                             }
                             else
                             {
@@ -1873,6 +1906,8 @@ namespace PickupAPi.Controllers
             HtmlNodeCollection htmlNodeCollection2 = node.SelectNodes(".//tr");
             if (htmlNodeCollection2 == null) return;
 
+            int[] occupiedByRowSpan = new int[count];
+            double tableFontSize = count >= 5 ? 8.0 : (count == 4 ? 9.0 : 10.0);
             bool isFirstRow = true;
             foreach (HtmlNode item in htmlNodeCollection2)
             {
@@ -1882,10 +1917,22 @@ namespace PickupAPi.Controllers
                 HtmlNodeCollection htmlNodeCollection3 = item.SelectNodes("./th|./td");
                 if (htmlNodeCollection3 == null) continue;
 
-                for (int j = 0; j < htmlNodeCollection3.Count && j < table.Columns.Count; j++)
+                int columnIndex = 0;
+                for (int j = 0; j < htmlNodeCollection3.Count; j++)
                 {
+                    while (columnIndex < count && occupiedByRowSpan[columnIndex] > 0)
+                        columnIndex++;
+                    if (columnIndex >= count) break;
+
                     HtmlNode htmlNode2 = htmlNodeCollection3[j];
-                    Cell cell = row.Cells[j];
+                    int colSpan = Math.Max(1, htmlNode2.GetAttributeValue("colspan", 1));
+                    int rowSpan = Math.Max(1, htmlNode2.GetAttributeValue("rowspan", 1));
+                    colSpan = Math.Min(colSpan, count - columnIndex);
+                    Cell cell = row.Cells[columnIndex];
+                    if (colSpan > 1) cell.MergeRight = colSpan - 1;
+                    if (rowSpan > 1) cell.MergeDown = rowSpan - 1;
+                    for (int spanColumn = columnIndex; spanColumn < columnIndex + colSpan; spanColumn++)
+                        occupiedByRowSpan[spanColumn] = Math.Max(occupiedByRowSpan[spanColumn], rowSpan);
 
                     if (isFirstRow || htmlNode2.Name.Equals("th", StringComparison.OrdinalIgnoreCase))
                     {
@@ -1904,91 +1951,151 @@ namespace PickupAPi.Controllers
                         cell.Format.RightIndent = Unit.FromPoint(4.0);
                     }
 
-                    Paragraph paragraph2 = cell.AddParagraph();
-                    if (isFirstRow)
-                        paragraph2.Format.Font.Bold = true;
+                    cell.Format.Font.Size = Unit.FromPoint(tableFontSize);
+                    cell.VerticalAlignment = VerticalAlignment.Top;
+                    RenderTableCell(cell, htmlNode2, isFirstRow);
+                    columnIndex += colSpan;
+                }
+                for (int column = 0; column < occupiedByRowSpan.Length; column++)
+                    if (occupiedByRowSpan[column] > 0) occupiedByRowSpan[column]--;
+                isFirstRow = false;
+            }
+        }
 
-                    foreach (HtmlNode item2 in htmlNode2.ChildNodes)
+        private void RenderTableCell(Cell cell, HtmlNode cellNode, bool bold)
+        {
+            foreach (HtmlNode child in cellNode.ChildNodes)
+            {
+                if (child.Name.Equals("ul", StringComparison.OrdinalIgnoreCase) || child.Name.Equals("ol", StringComparison.OrdinalIgnoreCase))
+                {
+                    HtmlNodeCollection listItems = child.SelectNodes("./li");
+                    if (listItems == null) continue;
+                    foreach (HtmlNode listItem in listItems)
                     {
-                        if (item2.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                        {
-                            int index = cell.Column.Index;
-                            Unit width = cell.Table.Columns[index].Width;
-                            AddImageToParagraph(paragraph2, item2, width - Unit.FromCentimeter(0.2));
-                        }
-                        else if (item2.Name.Equals("p", StringComparison.OrdinalIgnoreCase))
-                        {
-                            foreach (HtmlNode item3 in item2.ChildNodes)
-                            {
-                                if (item3.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    try
-                                    {
-                                        int index2 = cell.Column.Index;
-                                        Unit width2 = cell.Table.Columns[index2].Width;
-                                        AddImageToParagraph(paragraph2, item3, width2 - Unit.FromCentimeter(0.2));
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        paragraph2.AddText("[Image could not be loaded - ]" + ex.Message);
-                                    }
-                                }
-                                else if (item3.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) || item3.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    FormattedText formattedText = paragraph2.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
-                                    formattedText.Bold = true;
-                                }
-                                else if (item3.Name.Equals("em", StringComparison.OrdinalIgnoreCase) || item3.Name.Equals("i", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    FormattedText formattedText2 = paragraph2.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
-                                    formattedText2.Italic = true;
-                                }
-                                else if (item3.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    FormattedText formattedText3 = paragraph2.AddFormattedText(WebUtility.HtmlDecode(item3.InnerText));
-                                    formattedText3.Underline = Underline.Single;
-                                }
-                                else if (item3.NodeType == HtmlNodeType.Text)
-                                {
-                                    string innerText = item3.InnerText;
-                                    if (!string.IsNullOrWhiteSpace(innerText))
-                                        paragraph2.AddText(WebUtility.HtmlDecode(innerText));
-                                }
-                                else
-                                {
-                                    string innerText2 = item3.InnerText;
-                                    if (!string.IsNullOrWhiteSpace(innerText2))
-                                        paragraph2.AddText(WebUtility.HtmlDecode(innerText2));
-                                }
-                            }
-                            paragraph2.Format.SpaceBefore = Unit.FromPoint(6.0);
-                            paragraph2.Format.SpaceAfter = Unit.FromPoint(6.0);
-                        }
-                        else if (item2.NodeType == HtmlNodeType.Text)
-                        {
-                            string innerText3 = item2.InnerText;
-                            if (!string.IsNullOrWhiteSpace(innerText3))
-                                paragraph2.AddText(WebUtility.HtmlDecode(innerText3));
-                            paragraph2.Format.SpaceBefore = Unit.FromPoint(6.0);
-                            paragraph2.Format.SpaceAfter = Unit.FromPoint(6.0);
-                        }
-                        else
-                        {
-                            string innerText4 = item2.InnerText;
-                            if (!string.IsNullOrWhiteSpace(innerText4))
-                                paragraph2.AddText(WebUtility.HtmlDecode(innerText4));
-                            paragraph2.Format.SpaceBefore = Unit.FromPoint(6.0);
-                            paragraph2.Format.SpaceAfter = Unit.FromPoint(6.0);
-                        }
+                        Paragraph listParagraph = cell.AddParagraph();
+                        listParagraph.Format.LeftIndent = Unit.FromPoint(9);
+                        listParagraph.Format.FirstLineIndent = Unit.FromPoint(-6);
+                        listParagraph.Format.SpaceBefore = Unit.FromPoint(1);
+                        listParagraph.Format.SpaceAfter = Unit.FromPoint(1);
+                        listParagraph.AddText("• ");
+                        AddTableInlineContent(listParagraph, listItem, bold);
+                    }
+                    continue;
+                }
+
+                Paragraph paragraph = cell.AddParagraph();
+                paragraph.Format.SpaceBefore = Unit.FromPoint(1);
+                paragraph.Format.SpaceAfter = Unit.FromPoint(2);
+                if (child.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                    AddImageToParagraph(paragraph, child, cell.Table.Columns[cell.Column.Index].Width - Unit.FromCentimeter(0.2));
+                else
+                    AddTableInlineContent(paragraph, child, bold);
+            }
+        }
+
+        private void AddTableInlineContent(Paragraph paragraph, HtmlNode node, bool bold)
+        {
+            if (node.NodeType == HtmlNodeType.Text)
+            {
+                string nodeText = WebUtility.HtmlDecode(node.InnerText);
+                if (!string.IsNullOrWhiteSpace(nodeText))
+                {
+                    FormattedText nodeFormatted = paragraph.AddFormattedText(nodeText.Replace("/", "/\u200B"));
+                    nodeFormatted.Bold = bold;
+                }
+                return;
+            }
+
+            foreach (HtmlNode child in node.ChildNodes)
+            {
+                if (child.NodeType == HtmlNodeType.Text)
+                {
+                    string text = WebUtility.HtmlDecode(child.InnerText);
+                    if (string.IsNullOrWhiteSpace(text)) continue;
+                    FormattedText formatted = paragraph.AddFormattedText(text.Replace("/", "/\u200B"));
+                    formatted.Bold = bold;
+                }
+                else if (child.Name.Equals("br", StringComparison.OrdinalIgnoreCase))
+                    paragraph.AddLineBreak();
+                else if (child.Name.Equals("ul", StringComparison.OrdinalIgnoreCase) || child.Name.Equals("ol", StringComparison.OrdinalIgnoreCase))
+                {
+                    HtmlNodeCollection listItems = child.SelectNodes("./li");
+                    if (listItems == null) continue;
+                    foreach (HtmlNode listItem in listItems)
+                    {
+                        paragraph.AddLineBreak();
+                        paragraph.AddText("• ");
+                        AddTableInlineContent(paragraph, listItem, bold);
                     }
                 }
-                isFirstRow = false;
+                else if (child.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) || child.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
+                {
+                    FormattedText formatted = paragraph.AddFormattedText(WebUtility.HtmlDecode(child.InnerText).Replace("/", "/\u200B"));
+                    formatted.Bold = true;
+                }
+                else if (child.Name.Equals("em", StringComparison.OrdinalIgnoreCase) || child.Name.Equals("i", StringComparison.OrdinalIgnoreCase))
+                {
+                    FormattedText formatted = paragraph.AddFormattedText(WebUtility.HtmlDecode(child.InnerText).Replace("/", "/\u200B"));
+                    formatted.Italic = true;
+                    formatted.Bold = bold;
+                }
+                else if (child.Name.Equals("u", StringComparison.OrdinalIgnoreCase))
+                {
+                    FormattedText formatted = paragraph.AddFormattedText(WebUtility.HtmlDecode(child.InnerText).Replace("/", "/\u200B"));
+                    formatted.Underline = Underline.Single;
+                    formatted.Bold = bold;
+                }
+                else if (child.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
+                    AddImageToParagraph(paragraph, child);
+                else
+                    AddTableInlineContent(paragraph, child, bold);
             }
         }
 
         // =========================================================================
         // IMAGE HELPERS
         // =========================================================================
+
+        private Unit GetRenderedImageWidth(string localPath, HtmlNode imgNode, Unit maximumWidth)
+        {
+            double naturalWidthPoints;
+            using (System.Drawing.Image sourceImage = System.Drawing.Image.FromFile(localPath))
+            {
+                // Browser image dimensions are CSS pixels; 1 px = 0.75 PDF points.
+                naturalWidthPoints = sourceImage.Width * 0.75;
+            }
+
+            double requestedWidthPoints = naturalWidthPoints;
+            if (imgNode != null)
+            {
+                string width = imgNode.GetAttributeValue("width", string.Empty);
+                Match styleWidth = Regex.Match(
+                    imgNode.GetAttributeValue("style", string.Empty),
+                    @"(?:^|;)\s*width\s*:\s*(\d+(?:\.\d+)?)px",
+                    RegexOptions.IgnoreCase);
+
+                double widthPixels;
+                if (styleWidth.Success && double.TryParse(
+                    styleWidth.Groups[1].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out widthPixels))
+                {
+                    requestedWidthPoints = widthPixels * 0.75;
+                }
+                else if (!width.Equals("auto", StringComparison.OrdinalIgnoreCase) &&
+                         double.TryParse(
+                             width.Replace("px", "").Trim(),
+                             System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture,
+                             out widthPixels))
+                {
+                    requestedWidthPoints = widthPixels * 0.75;
+                }
+            }
+
+            return Unit.FromPoint(Math.Min(requestedWidthPoints, maximumWidth.Point));
+        }
 
         private void AddImage(Section section, HtmlNode node)
         {
@@ -2010,9 +2117,7 @@ namespace PickupAPi.Controllers
                     image.LockAspectRatio = true;
                     Section sec = paragraph.Section;
                     Unit unit = sec.PageSetup.PageWidth - sec.PageSetup.LeftMargin - sec.PageSetup.RightMargin;
-                    Unit unit2 = Unit.FromCentimeter(15.0);
-                    if (unit2 > unit) unit2 = unit;
-                    image.Width = unit2;
+                    image.Width = GetRenderedImageWidth(localPath, node, unit);
                     return;
                 }
 
@@ -2025,9 +2130,7 @@ namespace PickupAPi.Controllers
                     image2.LockAspectRatio = true;
                     Section sec2 = paragraph.Section;
                     Unit unit3 = sec2.PageSetup.PageWidth - sec2.PageSetup.LeftMargin - sec2.PageSetup.RightMargin;
-                    Unit unit4 = Unit.FromCentimeter(15.0);
-                    if (unit4 > unit3) unit4 = unit3;
-                    image2.Width = unit4;
+                    image2.Width = GetRenderedImageWidth(text2, node, unit3);
                 }
             }
             catch (Exception ex)
@@ -2280,7 +2383,33 @@ namespace PickupAPi.Controllers
         private double[] CalculateColumnWidths(HtmlNode tableNode, int columnCount)
         {
             double[] array = new double[columnCount];
-            double colWidth = 16.0 / columnCount;
+            const double availableWidthCm = 16.0;
+            HtmlNodeCollection columns = tableNode.SelectNodes("./colgroup/col");
+            if (columns != null && columns.Count >= columnCount)
+            {
+                double[] sourceWidths = new double[columnCount];
+                double sourceTotal = 0.0;
+                for (int i = 0; i < columnCount; i++)
+                {
+                    Match match = Regex.Match(columns[i].GetAttributeValue("style", string.Empty),
+                        @"(?:^|;)\s*width\s*:\s*([0-9.]+)px", RegexOptions.IgnoreCase);
+                    double width;
+                    if (match.Success && double.TryParse(match.Groups[1].Value, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out width) && width > 0)
+                    {
+                        sourceWidths[i] = width;
+                        sourceTotal += width;
+                    }
+                }
+                if (sourceTotal > 0 && sourceWidths.All(width => width > 0))
+                {
+                    for (int i = 0; i < columnCount; i++)
+                        array[i] = availableWidthCm * sourceWidths[i] / sourceTotal;
+                    return array;
+                }
+            }
+
+            double colWidth = availableWidthCm / columnCount;
             for (int i = 0; i < columnCount; i++)
                 array[i] = colWidth;
             return array;
@@ -2289,6 +2418,40 @@ namespace PickupAPi.Controllers
         // =========================================================================
         // DOCUMENT360 API HELPERS
         // =========================================================================
+
+        private async Task<Tuple<string, string>> GetArticleFromPublicPage(string articleUrl)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(articleUrl, UriKind.Absolute, out uri) ||
+                uri.Scheme != Uri.UriSchemeHttps ||
+                !uri.Host.Equals("kms.cloud.global", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new HttpRequestException("Public-page fallback only supports https://kms.cloud.global URLs.");
+            }
+
+            using (HttpClient client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromSeconds(30);
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("NEXUS-BusinessPdf/1.0");
+
+                string pageHtml = await client.GetStringAsync(uri);
+                HtmlDocument document = new HtmlDocument();
+                document.LoadHtml(pageHtml);
+
+                HtmlNode articleNode = document.DocumentNode.SelectSingleNode(
+                    "//article[contains(concat(' ', normalize-space(@class), ' '), ' editor360-preview-content ')]");
+                if (articleNode == null)
+                    throw new HttpRequestException("The public Document360 page did not contain article content.");
+
+                HtmlNode titleNode = document.DocumentNode.SelectSingleNode(
+                    "//*[contains(concat(' ', normalize-space(@class), ' '), ' article-title ')]");
+                string title = titleNode == null
+                    ? string.Empty
+                    : WebUtility.HtmlDecode(titleNode.InnerText).Trim();
+
+                return Tuple.Create(title, articleNode.InnerHtml);
+            }
+        }
 
         private async Task<string> GetArticleByUrl(string articleUrl)
         {

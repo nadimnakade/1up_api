@@ -281,6 +281,7 @@
       <Private>True</Private>
       <Private>True</Private>
     </Reference>
+    <Reference Include="System.IdentityModel" />
     <Reference Include="System.IO, Version=4.1.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
       <HintPath>..\packages\System.IO.4.1.0\lib\net462\System.IO.dll</HintPath>
       <Private>True</Private>
@@ -494,6 +495,8 @@
     <Compile Include="App_Start\SwaggerConfig.cs" />
     <Compile Include="App_Start\WebApiConfig.cs" />
     <Compile Include="Controllers\BusinessPdfController.cs" />
+    <Compile Include="Controllers\Document360AuthController.cs" />
+    <Compile Include="Controllers\Document360Controller.cs" />
     <Compile Include="Controllers\ReportGenerator.cs" />
     <Compile Include="Controllers\HomeController.cs" />
     <Compile Include="Controllers\PDFController.cs" />
@@ -513,6 +516,7 @@
     <Compile Include="Models\CoverLetterGenerator.cs" />
     <Compile Include="Models\Dialer.cs" />
     <Compile Include="Models\Employee.cs" />
+    <Compile Include="Models\EmployeeExtension.cs" />
     <Compile Include="Models\Finans.cs" />
     <Compile Include="Models\HtmlRequestModel.cs" />
     <Compile Include="Models\Pickup.cs" />
@@ -530,6 +534,7 @@
     <Compile Include="Services\PdfRendererService.cs" />
     <Compile Include="Services\TableService.cs" />
     <Compile Include="Utils\HtmlUtils.cs" />
+    <Compile Include="Utils\JwtHelper.cs" />
     <Compile Include="Utils\MontserratFontResolver.cs" />
     <Compile Include="Utils\StyleConstants.cs" />
     <Compile Include="WebSocket.cs" />
@@ -540,6 +545,9 @@
     <Content Include="Content\bootstrap-theme.min.css" />
     <Content Include="Content\bootstrap.css" />
     <Content Include="Content\bootstrap.min.css" />
+    <Content Include="Content\doc360-multiworkspace.css" />
+    <Content Include="Content\multi-workspace-demo.html" />
+    <Content Include="Scripts\doc360-multiworkspace.js" />
     <Content Include="favicon.ico" />
     <Content Include="fonts\glyphicons-halflings-regular.svg" />
     <Content Include="Global.asax" />

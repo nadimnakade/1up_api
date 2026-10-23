@@ -74,11 +74,11 @@
     }
 
     function injectInlinePdfButton() {
-        //nst followBtn = document.querySelector('.follow-button');
-        //nst editarticlebtn = document.querySelector( '.article-more-options > .edit-article-btn');    
+        if (document.getElementById('exportPdfBtn')) return;
 
-        const favoriteBtn = document.querySelector('.follow-button');
-        if (!favoriteBtn || document.getElementById('exportPdfBtn')) return;
+        const followBtn = document.querySelector('.follow-button');
+        const actions = document.querySelector('.article-more-options');
+        if (!followBtn && !actions) return;
 
         const btn = document.createElement('button');
         btn.id = "exportPdfBtn";
@@ -89,34 +89,16 @@
             generateInlinePdf();
         };
 
-        //followBtn.parentNode.insertBefore(btn, followBtn);
+        const wrapper = document.createElement('span');
+        wrapper.className = 'd-inline-block';
+        wrapper.appendChild(btn);
 
-        //const favoriteBtn = document.querySelector('.favorite-toggle-btn');
-
-        if (favoriteBtn) {
-            //favoriteBtn.parentNode.insertBefore(btn, favoriteBtn);
-            //favoriteBtn.insertAdjacentElement('afterend', btn);
-            // Create wrapper exactly like Document360's structure
-            debugger;
-            const wrapper = document.createElement('span');
-
-            wrapper.appendChild(btn);
-
-            // Insert wrapper after the Follow wrapper
-            const followWrapper = favoriteBtn.parentElement;
-            console.log(followWrapper);
-            followWrapper.insertAdjacentElement('afterend', wrapper);
+        if (followBtn && followBtn.parentElement) {
+            followBtn.parentElement.insertAdjacentElement('afterend', wrapper);
+        } else {
+            actions.insertAdjacentElement('afterbegin', wrapper);
         }
-        console.log("✅ Inline Export PDF button added");
-        /*
-        if(editarticlebtn){       
-           console.log('edit here')
-           editarticlebtn.insertAdjacentElement('afterend', btn);	
-        }
-        else{   
-            console.log('followup')
-           followBtn.parentElement.after(btn);
-        }*/
+
         console.log("✅ Inline Export PDF button added");
 
     }
@@ -875,6 +857,11 @@
 
         initializePDFExport();
         setupPortalSearch();
+
+        // Multi-workspace portal/sidebar (external-JS-only deployment:
+        // also loads if this file is the sole custom script registered)
+        loadScript("https://1up.co.in/NEXUS_API/Scripts/doc360-multiworkspace.js")
+            .catch(err => console.error("❌ Failed to load multi-workspace script", err));
     });
 
     window.addEventListener("load", () => {

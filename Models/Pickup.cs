@@ -82,6 +82,8 @@ namespace PickupAPi.Models
     }
 
 
+
+
     public class UpdateStatus
     {
         public int Key { get; set; }
@@ -1896,6 +1898,8 @@ namespace PickupAPi.Models
             }
             return intRetVal;
         }
+
+        
         //public int fnSaveCallLogsUtilities(List<CallLogUtilitiesList> CallLog)
         //{
         //    //List<CallLogList> lstCallLog = objCallLogInput.RequestData.lstCallLog;            
@@ -2031,4 +2035,23 @@ public class BankSearch
     public int RMContact { get; set; }
     public int TotalCount { get;  set; }
     public string Serviceable { get; set; }
+}
+
+public class EmployeeDID
+{
+    public int DID_ID { get; set; }
+    public string EMP_CODE { get; set; }
+    public string ClientName { get; set; }
+    public string Bank { get; set; }
+    public string CPVStatus { get; set; }
+    public string DisbAmt { get; set; }
+    public string DisbDate { get; set; }
+    public string LoginAmt { get; set; }
+    public string Comments { get; set; }
+    public string Status { get; set; }
+    public string Caller { get; set; }
+    public string Product { get; set; }
+    public string AppNo { get; set; }
+    public string LosNo { get; set; }
+    public string UpdatedOn { get; set; }
 }
