@@ -1129,10 +1129,41 @@ namespace PickupAPi.Controllers
             string iconPath = null;
             HtmlNode titleNode = item.SelectSingleNode(
                 ".//*[contains(concat(' ', normalize-space(@class), ' '), ' blockquote-title ')]");
+            HtmlNode contentRoot = item;
             string blockquoteTitle = titleNode == null
                 ? string.Empty
                 : WebUtility.HtmlDecode(titleNode.InnerText).Trim();
-            List<HtmlNode> bodyNodes = item.ChildNodes
+
+            // Document360 snippets can use a compact callout shape such as
+            // <blockquote><p><strong>Warning</strong>: ...</p></blockquote>
+            // instead of the usual .blockquote-title wrapper.
+            if (titleNode == null)
+            {
+                HtmlNode inlineTitleNode = item.SelectSingleNode("./p[1]/strong[1] | ./p[1]/b[1]");
+                string inlineTitle = inlineTitleNode == null
+                    ? string.Empty
+                    : WebUtility.HtmlDecode(inlineTitleNode.InnerText).Trim().TrimEnd(':');
+                if (inlineTitle.Equals("Note", StringComparison.OrdinalIgnoreCase) ||
+                    inlineTitle.Equals("Notes", StringComparison.OrdinalIgnoreCase) ||
+                    inlineTitle.Equals("Warning", StringComparison.OrdinalIgnoreCase) ||
+                    inlineTitle.Equals("Tip", StringComparison.OrdinalIgnoreCase))
+                {
+                    contentRoot = item.CloneNode(true);
+                    titleNode = contentRoot.SelectSingleNode("./p[1]/strong[1] | ./p[1]/b[1]");
+                    if (titleNode != null)
+                    {
+                        HtmlNode titleParent = titleNode.ParentNode;
+                        titleNode.Remove();
+                        HtmlNode firstText = titleParent.ChildNodes
+                            .FirstOrDefault(n => n.NodeType == HtmlNodeType.Text && !string.IsNullOrWhiteSpace(n.InnerText));
+                        if (firstText != null)
+                            ((HtmlTextNode)firstText).Text = Regex.Replace(firstText.InnerText, @"^\s*:\s*", string.Empty);
+                    }
+                    blockquoteTitle = inlineTitle;
+                }
+            }
+
+            List<HtmlNode> bodyNodes = contentRoot.ChildNodes
                 .Where(n => n != titleNode &&
                             !(n.NodeType == HtmlNodeType.Element && n.HasClass("blockquote-title")))
                 .Where(n => !string.IsNullOrWhiteSpace(n.InnerText)).ToList();
@@ -1964,6 +1995,12 @@ namespace PickupAPi.Controllers
 
         private void RenderTableCell(Cell cell, HtmlNode cellNode, bool bold)
         {
+            Unit cellContentWidth = Unit.FromCentimeter(0);
+            int lastColumn = Math.Min(cell.Table.Columns.Count - 1, cell.Column.Index + cell.MergeRight);
+            for (int column = cell.Column.Index; column <= lastColumn; column++)
+                cellContentWidth += cell.Table.Columns[column].Width;
+            cellContentWidth -= Unit.FromCentimeter(0.2);
+
             foreach (HtmlNode child in cellNode.ChildNodes)
             {
                 if (child.Name.Equals("ul", StringComparison.OrdinalIgnoreCase) || child.Name.Equals("ol", StringComparison.OrdinalIgnoreCase))
@@ -1978,7 +2015,7 @@ namespace PickupAPi.Controllers
                         listParagraph.Format.SpaceBefore = Unit.FromPoint(1);
                         listParagraph.Format.SpaceAfter = Unit.FromPoint(1);
                         listParagraph.AddText("• ");
-                        AddTableInlineContent(listParagraph, listItem, bold);
+                        AddTableInlineContent(listParagraph, listItem, bold, cellContentWidth);
                     }
                     continue;
                 }
@@ -1987,13 +2024,13 @@ namespace PickupAPi.Controllers
                 paragraph.Format.SpaceBefore = Unit.FromPoint(1);
                 paragraph.Format.SpaceAfter = Unit.FromPoint(2);
                 if (child.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                    AddImageToParagraph(paragraph, child, cell.Table.Columns[cell.Column.Index].Width - Unit.FromCentimeter(0.2));
+                    AddImageToParagraph(paragraph, child, cellContentWidth);
                 else
-                    AddTableInlineContent(paragraph, child, bold);
+                    AddTableInlineContent(paragraph, child, bold, cellContentWidth);
             }
         }
 
-        private void AddTableInlineContent(Paragraph paragraph, HtmlNode node, bool bold)
+        private void AddTableInlineContent(Paragraph paragraph, HtmlNode node, bool bold, Unit? containerWidth = null)
         {
             if (node.NodeType == HtmlNodeType.Text)
             {
@@ -2025,7 +2062,7 @@ namespace PickupAPi.Controllers
                     {
                         paragraph.AddLineBreak();
                         paragraph.AddText("• ");
-                        AddTableInlineContent(paragraph, listItem, bold);
+                        AddTableInlineContent(paragraph, listItem, bold, containerWidth);
                     }
                 }
                 else if (child.Name.Equals("strong", StringComparison.OrdinalIgnoreCase) || child.Name.Equals("b", StringComparison.OrdinalIgnoreCase))
@@ -2046,9 +2083,9 @@ namespace PickupAPi.Controllers
                     formatted.Bold = bold;
                 }
                 else if (child.Name.Equals("img", StringComparison.OrdinalIgnoreCase))
-                    AddImageToParagraph(paragraph, child);
+                    AddImageToParagraph(paragraph, child, containerWidth);
                 else
-                    AddTableInlineContent(paragraph, child, bold);
+                    AddTableInlineContent(paragraph, child, bold, containerWidth);
             }
         }
 
